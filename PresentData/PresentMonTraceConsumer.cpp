@@ -2377,6 +2377,12 @@ void PMTraceConsumer::CompletePresent(std::shared_ptr<PresentEvent> const& p)
         }
     }
 
+    // Remove the app frame data for this present
+    auto ii = mPresentByAppFrameId.find(std::make_pair(appFrameId, processId));
+    if (ii != mPresentByAppFrameId.end()) {
+        mPresentByAppFrameId.erase(ii);
+    }
+
     // Prune out old PC Latency timing data to prevent memory leaks.
     // This is critical because PCL data accumulates for every frame and the
     // PCLStatsShutdown event (the only other cleanup mechanism) is app-controlled.
@@ -2758,7 +2764,15 @@ void PMTraceConsumer::HandleProcessEvent(EVENT_RECORD* pEventRecord)
                 });
                 mLatestPingTimestampByProcessId.erase(event.ProcessId);
             }
-
+            // Clean up App Timing data as well...
+            if (mTrackAppTiming) {
+                std::erase_if(mAppTimingDataByAppFrameId, [&event](const auto& p) {
+                    return p.second.ProcessId == event.ProcessId;
+                });
+                std::erase_if(mPresentByAppFrameId, [&event](const auto& p) {
+                    return p.first.second == event.ProcessId;
+                });
+            }
             break;
         }
         default:
@@ -2786,12 +2800,20 @@ void PMTraceConsumer::HandleProcessEvent(EVENT_RECORD* pEventRecord)
             event.ProcessId    = desc[0].GetData<uint32_t>();
             event.IsStartEvent = false;
 
-            // Clean up PC Latency tracking data for this process to prevent memory leaks.
+            // Clean up PC Latency and AppTiming tracking data for this process to prevent memory leaks.
             if (mTrackPcLatency) {
                 std::erase_if(mPclTimingDataByPclFrameId, [&event](const auto& p) {
                     return p.first.second == event.ProcessId;
                 });
                 mLatestPingTimestampByProcessId.erase(event.ProcessId);
+            }
+            if (mTrackAppTiming) {
+                std::erase_if(mAppTimingDataByAppFrameId, [&event](const auto& p) {
+                    return p.second.ProcessId == event.ProcessId;
+                    });
+                std::erase_if(mPresentByAppFrameId, [&event](const auto& p) {
+                    return p.first.second == event.ProcessId;
+                    });
             }
         } else {
             return;
@@ -3135,6 +3157,34 @@ void PMTraceConsumer::HandleTraceLoggingEvent(EVENT_RECORD* pEventRecord)
 void PMTraceConsumer::HandlePclEvent(EVENT_RECORD* pEventRecord)
 {
     try {
+        auto const& hdr = pEventRecord->EventHeader;
+        auto const& desc = hdr.EventDescriptor;
+
+        // Check cache first to avoid expensive TdhGetEventInformation calls for known event types.
+        // This is critical for high-frequency PCLStatsInput/ReflexStatsInput events which fire
+        // on every input (including gamepad at 100-1000Hz) and only need header data.
+        PclEventKey cacheKey{ desc.Id, desc.Opcode, desc.Level };
+        auto cacheIt = mPclEventTypeCache.find(cacheKey);
+
+        if (cacheIt != mPclEventTypeCache.end()) {
+            // Cache hit - fast path for known event types
+            switch (cacheIt->second) {
+            case PclEventType::StatsInput:
+                // Fast path: PCLStatsInput/ReflexStatsInput only needs header data (processId, timestamp)
+                // No TDH decode required - this eliminates the performance bottleneck
+                mLatestPingTimestampByProcessId[hdr.ProcessId] = hdr.TimeStamp.QuadPart;
+                return;
+            case PclEventType::Unknown:
+                // Previously decoded but unhandled event type - skip entirely
+                return;
+            default:
+                // Other event types (StatsEvent, StatsInit, StatsShutdown) need payload parsing
+                // Fall through to full decode path
+                break;
+            }
+        }
+
+        // Cache miss or event type that needs payload - do full TDH decode
         if (!mTraceLoggingDecoder.DecodeTraceLoggingEventRecord(pEventRecord)) {
             pmlog_dbg("Failed to decode trace logging event"); // too spammy?
             return;
@@ -3146,19 +3196,37 @@ void PMTraceConsumer::HandlePclEvent(EVENT_RECORD* pEventRecord)
             return;
         }
 
+        // Cache the event type for future fast-path lookup
+        PclEventType eventType = PclEventType::Unknown;
+        if (eventName.value() == L"PCLStatsInput" || eventName.value() == L"ReflexStatsInput") {
+            eventType = PclEventType::StatsInput;
+        } else if (eventName.value() == L"PCLStatsEvent" || eventName.value() == L"ReflexStatsEvent") {
+            eventType = PclEventType::StatsEvent;
+        } else if (eventName.value() == L"PCLStatsInit" || eventName.value() == L"ReflexStatsInit") {
+            eventType = PclEventType::StatsInit;
+        } else if (eventName.value() == L"PCLStatsShutdown" || eventName.value() == L"ReflexStatsShutdown") {
+            eventType = PclEventType::StatsShutdown;
+        }
+        mPclEventTypeCache[cacheKey] = eventType;
+
         if (eventName.has_value()) {
             if (eventName.value() == L"PCLStatsInit" ||
                 eventName.value() == L"ReflexStatsInit") {
                 pmlog_info("Received init event: " + pmon::util::str::ToNarrow(*eventName));
             }
-            else if (eventName.value() == L"PCLStatsEvent" || 
+            else if (eventName.value() == L"PCLStatsInput" ||
+                     eventName.value() == L"ReflexStatsInput") {
+                // First encounter of this event type - process it (subsequent ones use fast path above)
+                mLatestPingTimestampByProcessId[hdr.ProcessId] = hdr.TimeStamp.QuadPart;
+            }
+            else if (eventName.value() == L"PCLStatsEvent" ||
                      eventName.value() == L"ReflexStatsEvent") {
                 auto marker = (Nvidia_PCL::PCLMarker)mTraceLoggingDecoder.GetNumericPropertyValue<uint32_t>(L"Marker");
                 auto frameId = (uint32_t)mTraceLoggingDecoder.GetNumericPropertyValue<uint64_t>(L"FrameID");
+                auto processId = hdr.ProcessId;
+                auto timestamp = hdr.TimeStamp.QuadPart;
                 switch (marker) {
                 case Nvidia_PCL::PCLMarker::SimulationStart: {
-                    auto processId = pEventRecord->EventHeader.ProcessId;
-                    auto timestamp = pEventRecord->EventHeader.TimeStamp.QuadPart;
                     auto key = std::make_pair(frameId, processId);
                     auto ij = mPclTimingDataByPclFrameId.find(key);
                     if (ij != mPclTimingDataByPclFrameId.end()) {
@@ -3173,8 +3241,6 @@ void PMTraceConsumer::HandlePclEvent(EVENT_RECORD* pEventRecord)
                 }
                 break;
                 case Nvidia_PCL::PCLMarker::SimulationEnd: {
-                    auto processId = pEventRecord->EventHeader.ProcessId;
-                    auto timestamp = pEventRecord->EventHeader.TimeStamp.QuadPart;
                     auto key = std::make_pair(frameId, processId);
                     auto ij = mPclTimingDataByPclFrameId.find(key);
                     if (ij != mPclTimingDataByPclFrameId.end()) {
@@ -3189,8 +3255,6 @@ void PMTraceConsumer::HandlePclEvent(EVENT_RECORD* pEventRecord)
                 }
                 break;
                 case Nvidia_PCL::PCLMarker::RenderSubmitStart: {
-                    auto processId = pEventRecord->EventHeader.ProcessId;
-                    auto timestamp = pEventRecord->EventHeader.TimeStamp.QuadPart;
                     auto key = std::make_pair(frameId, processId);
                     auto ij = mPclTimingDataByPclFrameId.find(key);
                     if (ij != mPclTimingDataByPclFrameId.end()) {
@@ -3205,8 +3269,6 @@ void PMTraceConsumer::HandlePclEvent(EVENT_RECORD* pEventRecord)
                 }
                 break;
                 case Nvidia_PCL::PCLMarker::RenderSubmitEnd: {
-                    auto processId = pEventRecord->EventHeader.ProcessId;
-                    auto timestamp = pEventRecord->EventHeader.TimeStamp.QuadPart;
                     auto key = std::make_pair(frameId, processId);
                     auto ij = mPclTimingDataByPclFrameId.find(key);
                     if (ij != mPclTimingDataByPclFrameId.end()) {
@@ -3221,8 +3283,6 @@ void PMTraceConsumer::HandlePclEvent(EVENT_RECORD* pEventRecord)
                 }
                 break;
                 case Nvidia_PCL::PCLMarker::PresentStart: {
-                    auto processId = pEventRecord->EventHeader.ProcessId;
-                    auto timestamp = pEventRecord->EventHeader.TimeStamp.QuadPart;
                     auto key = std::make_pair(frameId, processId);
                     auto ij = mPclTimingDataByPclFrameId.find(key);
                     if (ij != mPclTimingDataByPclFrameId.end()) {
@@ -3237,8 +3297,6 @@ void PMTraceConsumer::HandlePclEvent(EVENT_RECORD* pEventRecord)
                 }
                 break;
                 case Nvidia_PCL::PCLMarker::PresentEnd: {
-                    auto processId = pEventRecord->EventHeader.ProcessId;
-                    auto timestamp = pEventRecord->EventHeader.TimeStamp.QuadPart;
                     auto key = std::make_pair(frameId, processId);
                     auto ij = mPclTimingDataByPclFrameId.find(key);
                     if (ij != mPclTimingDataByPclFrameId.end()) {
@@ -3253,8 +3311,6 @@ void PMTraceConsumer::HandlePclEvent(EVENT_RECORD* pEventRecord)
                 }
                 break;
                 case Nvidia_PCL::PCLMarker::PCLLatencyPing: {
-                    auto processId = pEventRecord->EventHeader.ProcessId;
-                    auto timestamp = pEventRecord->EventHeader.TimeStamp.QuadPart;
                     auto key = std::make_pair(frameId, processId);
                     auto ij = mPclTimingDataByPclFrameId.find(key);
                     if (ij != mPclTimingDataByPclFrameId.end()) {
@@ -3277,8 +3333,6 @@ void PMTraceConsumer::HandlePclEvent(EVENT_RECORD* pEventRecord)
                 }
                 break;
                 case Nvidia_PCL::PCLMarker::OutOfBandPresentStart: {
-                    auto processId = pEventRecord->EventHeader.ProcessId;
-                    auto timestamp = pEventRecord->EventHeader.TimeStamp.QuadPart;
                     // If we receive an out of band present start, we will use it
                     // to attach the pcl timing data to the present
                     mUsingOutOfBoundPresentStart = true;
@@ -3302,18 +3356,12 @@ void PMTraceConsumer::HandlePclEvent(EVENT_RECORD* pEventRecord)
                 }
                 break;
                 }
-            } else if (eventName.value() == L"PCLStatsInput" ||
-                       eventName.value() == L"ReflexStatsInput") {
-                auto processId = pEventRecord->EventHeader.ProcessId;
-                auto timestamp = pEventRecord->EventHeader.TimeStamp.QuadPart;
-                mLatestPingTimestampByProcessId[processId] = timestamp;
-
             } else if (eventName.value() == L"PCLStatsShutdown" ||
                        eventName.value() == L"ReflexStatsShutdown") {
                 // PCL stats is shutting down for this process. Remove
-                // all PCL tracking structure for this process id. 
+                // all PCL tracking structure for this process id.
                 pmlog_info("Shutting down PCL stats tracking");
-                auto processId = pEventRecord->EventHeader.ProcessId;
+                auto processId = hdr.ProcessId;
                 std::erase_if(mPclTimingDataByPclFrameId, [processId](const auto& p) {
                     return p.first.second == processId; });
                 std::erase_if(mLatestPingTimestampByProcessId, [processId](const auto& p) {

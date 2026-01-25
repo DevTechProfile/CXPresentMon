@@ -516,6 +516,32 @@ struct PMTraceConsumer
     std::unordered_map<uint32_t, uint64_t>                      mLatestPingTimestampByProcessId;        // ProcessId -> Latest Ping Timestamp
     bool mUsingOutOfBoundPresentStart = false;
 
+    // Cache for PCL event type identification to avoid expensive TdhGetEventInformation calls.
+    // Maps (EventId, Opcode, Level) -> event name string for fast lookup on subsequent events.
+    // This is critical for high-frequency PCLStatsInput/ReflexStatsInput events which fire on
+    // every input (including gamepad) and only need header data (processId, timestamp).
+    struct PclEventKey {
+        USHORT Id;
+        UCHAR Opcode;
+        UCHAR Level;
+        bool operator==(const PclEventKey& other) const {
+            return Id == other.Id && Opcode == other.Opcode && Level == other.Level;
+        }
+    };
+    struct PclEventKeyHash {
+        size_t operator()(const PclEventKey& k) const {
+            return std::hash<uint32_t>()((uint32_t(k.Id) << 16) | (uint32_t(k.Opcode) << 8) | k.Level);
+        }
+    };
+    enum class PclEventType {
+        Unknown,
+        StatsInput,      // PCLStatsInput / ReflexStatsInput - high frequency, header-only
+        StatsEvent,      // PCLStatsEvent / ReflexStatsEvent - needs payload parsing
+        StatsInit,       // PCLStatsInit / ReflexStatsInit
+        StatsShutdown,   // PCLStatsShutdown / ReflexStatsShutdown
+    };
+    std::unordered_map<PclEventKey, PclEventType, PclEventKeyHash> mPclEventTypeCache;
+
     // mGpuTrace tracks work executed on the GPU.
     GpuTrace mGpuTrace;
 
