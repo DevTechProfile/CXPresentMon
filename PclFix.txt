@@ -1,0 +1,105 @@
+PCL Event Handling Performance Fix Summary
+==========================================
+
+Problem:
+--------
+When using a gamepad, high-frequency PCLStatsInput/ReflexStatsInput events (100-1000Hz)
+caused system-wide frame time issues. The bottleneck was TdhGetEventInformation calls
+for every TraceLogging event.
+
+Root Cause:
+-----------
+1. TraceLogging events require TdhGetEventInformation to decode event names and properties
+2. This is an expensive Windows API call
+3. Gamepad input generates thousands of StatsInput events per second
+4. Original caching attempt using (EventId, Opcode, Level) failed because TraceLogging
+   events share identical EVENT_DESCRIPTOR values - they distinguish events by name
+   embedded in metadata, not by descriptor fields
+
+Solution:
+---------
+Implemented multi-level optimization to eliminate TDH calls and minimize processing
+for high-frequency events.
+
+Files Modified:
+---------------
+1. PresentData/PresentMonTraceConsumer.hpp
+2. PresentData/PresentMonTraceConsumer.cpp
+
+Changes in Detail:
+------------------
+
+1. EVENT TYPE CACHING BY UserDataLength
+   - Different PCL event types have different payload sizes
+   - Cache the UserDataLength for StatsInput and StatsEvent after first TDH decode
+   - Use direct integer comparison instead of hash map lookup
+
+   New members in PMTraceConsumer:
+   - USHORT mPclStatsInputLength = 0;   // UserDataLength for StatsInput events
+   - USHORT mPclStatsEventLength = 0;   // UserDataLength for StatsEvent events
+
+2. DIRECT PAYLOAD READING FOR StatsEvent
+   - TraceLogging payload layout: Marker (uint32, offset 0) + FrameID (uint64, offset 4)
+   - Read values directly from pEventRecord->UserData without TDH decode
+   - Extracted HandlePclStatsEvent() helper function to process markers
+
+3. CACHED POINTER FOR StatsInput TIMESTAMP UPDATES
+   - Most gamepad input comes from single process
+   - Cache pointer to hash map entry to avoid repeated lookups
+
+   New members in PMTraceConsumer:
+   - uint32_t mLastPingProcessId = 0;
+   - uint64_t* mLastPingTimestampPtr = nullptr;
+
+   - If same ProcessId: direct pointer write (no hash map lookup)
+   - If different ProcessId: hash map lookup + cache update
+   - Cache invalidated on process shutdown/exit
+
+4. REMOVED TRY-CATCH FROM FAST PATH
+   - Exception handling only for slow path (first occurrence, rare events)
+
+Performance Characteristics:
+----------------------------
+
+StatsInput Fast Path (gamepad input - most frequent):
+- 2 integer comparisons (event type check)
+- 2 integer comparisons (ProcessId + nullptr check)
+- 1 direct memory write
+- NO hash map lookup
+- NO TDH decode
+- NO exception handling overhead
+
+StatsEvent Fast Path (frame markers):
+- 2 integer comparisons (event type check)
+- 2 memory reads from UserData (Marker, FrameID)
+- HandlePclStatsEvent() call with hash map operations
+- NO TDH decode
+
+Slow Path (first occurrence, Init, Shutdown):
+- Full TDH decode via TraceLoggingDecoder
+- Event type cached for future fast path
+- Only happens once per event type per session
+
+Cache Invalidation:
+-------------------
+The cached timestamp pointer is invalidated when:
+- PCLStatsShutdown event received
+- Process exit detected (two locations in HandleProcessEvent)
+
+This prevents use-after-free if hash map entry is erased.
+
+Testing Notes:
+--------------
+- Setting mTrackPcLatency = false completely disables PCL provider at ETW level
+- If performance issues persist with optimizations, the overhead is in ETW event
+  delivery infrastructure, not in HandlePclEvent processing
+- Consider throttling/sampling if ETW overhead is still problematic
+
+Header Include Added:
+---------------------
+#include "ETW/Nvidia_PCL.h" added to PresentMonTraceConsumer.hpp for Nvidia_PCL::PCLMarker
+
+Function Declaration Added:
+---------------------------
+void HandlePclStatsEvent(uint32_t processId, uint64_t timestamp,
+                         Nvidia_PCL::PCLMarker marker, uint32_t frameId);
