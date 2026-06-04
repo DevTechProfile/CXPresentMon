@@ -57,7 +57,9 @@ namespace pmapi
             if (auto sta = pmFinishEtlLogging(hSession_, hLogger_, buffer, (uint32_t)std::size(buffer));
                 sta == PM_STATUS_SUCCESS) {
                 std::error_code ec;
-                std::filesystem::remove(buffer, ec);
+                // TODO: report this error via diagnostic custom
+                try { std::filesystem::remove(buffer, ec); }
+                catch (...) {}
             }
         }
         Clear_();
@@ -77,9 +79,12 @@ namespace pmapi
         :
         hSession_{ hSession }
     {
-        if (auto sta = pmStartEtlLogging(hSession_, &hLogger_, 0, 0);
-            sta != PM_STATUS_SUCCESS) {
-            throw ApiErrorException{ sta, "Failed to start etl logging session" };
+        const auto sta = pmStartEtlLogging(hSession_, &hLogger_, 0, 0);
+        if (sta != PM_STATUS_SUCCESS) {
+            const char* msg = sta == PM_STATUS_FEATURE_DISABLED ? 
+                "ETL logging is not currently supported" :
+                "Failed to start etl logging session";
+            throw ApiErrorException{ sta, msg };
         }
     }
     // zero out members, useful after emptying via move or reset

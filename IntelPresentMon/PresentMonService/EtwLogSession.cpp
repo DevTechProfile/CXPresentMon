@@ -58,10 +58,11 @@ namespace pmon::svc
 		traceProps_.BufferSize = 64;
 		wcscpy_s(traceProps_.LoggerName, std::size(traceProps_.LoggerName), loggerName.c_str());
 		wcscpy_s(traceProps_.LogFileName, std::size(traceProps_.LogFileName), logFilePath.c_str());
-		// create the trace logger session
+        // create the trace logger session
         if (auto sta = StartTraceW(&hTraceSession_, traceProps_.LoggerName, &traceProps_);
             sta != ERROR_SUCCESS) {
-            pmlog_error("Failed to start ETL trace").hr(sta).raise<util::Exception>();
+            pmlog_error("Failed to start ETL trace").hr(sta);
+            throw util::Except<util::Exception>("Failed to start ETL trace");
         }
         // enable providers with various filter mechanisms base on the injected provider descriptions
         for (auto& p : providers) {
@@ -124,7 +125,10 @@ namespace pmon::svc
     EtwLogSession::~EtwLogSession()
     {
         if (!Empty()) {
-            Finish();
+            try { Finish(); }
+            catch (...) {
+                pmlog_error(util::ReportException("EtwLogSession dtor"));
+            }
         }
     }
     bool EtwLogSession::Empty() const

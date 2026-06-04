@@ -1,6 +1,7 @@
 #include "../CommonUtilities/win/WinAPI.h"
 #include "../Core/source/kernel/Kernel.h"
 #include "../Core/source/infra/util/FolderResolver.h"
+#include "../CommonUtilities/log/IdentificationTable.h"
 #include "../Interprocess/source/act/SymmetricActionServer.h"
 #include "kact/KernelExecutionContext.h"
 #include "../AppCef/source/util/cact/TargetLostAction.h"
@@ -8,11 +9,13 @@
 #include "../AppCef/source/util/cact/PresentmonInitFailedAction.h"
 #include "../AppCef/source/util/cact/StalePidAction.h"
 #include "../AppCef/source/util/cact/HotkeyFiredAction.h"
+#include "../AppCef/source/util/UiProcessGuard.h"
 #include "../PresentMonAPIWrapper/PresentMonAPIWrapper.h"
 #include "../PresentMonAPIWrapperCommon/EnumMap.h"
 #include <Core/source/cli/CliOptions.h>
 #include <PresentMonAPI2Loader/Loader.h>
 #include <Core/source/infra/LogSetup.h>
+#include <CommonUtilities/file/PathUtils.h>
 #include <CommonUtilities/win/Utilities.h>
 #include <CommonUtilities/win/Privileges.h>
 #include <CommonUtilities/win/ProcessMapBuilder.h>
@@ -20,10 +23,9 @@
 #include <Shobjidl.h>
 #include <boost/process/v2/process.hpp>
 #include <boost/process/v2/windows/as_user_launcher.hpp>
-#include <array>
 #include <ranges>
 #include <iostream>
-
+#include <filesystem>
 
 using namespace pmon;
 namespace vi = std::views;
@@ -110,6 +112,121 @@ namespace kproc
 		freopen_s(&f, "CONOUT$", "w", stderr);
 		freopen_s(&f, "CONIN$", "r", stdin);
 	}
+
+	enum class ConcurrentUiInstanceAction
+	{
+		BringToForeground,
+		KillPrevious,
+	};
+
+	ConcurrentUiInstanceAction ShowConcurrentUiInstanceDialog_()
+	{
+		const auto result = MessageBoxW(nullptr,
+			L"Intel PresentMon is already running; concurrent instances are not supported. "
+			L"Bring previous instance to the foreground?\n\n"
+			L"Select Yes to bring previous instance to the foreground.\n"
+			L"Select No to terminate it and launch a new one.",
+			L"Intel PresentMon",
+			MB_YESNO | MB_DEFBUTTON2 | MB_ICONWARNING | MB_APPLMODAL | MB_SETFOREGROUND);
+		return result == IDYES ?
+			ConcurrentUiInstanceAction::BringToForeground :
+			ConcurrentUiInstanceAction::KillPrevious;
+	}
+
+	ConcurrentUiInstanceAction MakeConcurrentUiInstanceAction_(p2c::cli::DuplicateUiResponse response)
+	{
+		switch (response) {
+		case p2c::cli::DuplicateUiResponse::Yes:
+			return ConcurrentUiInstanceAction::BringToForeground;
+		case p2c::cli::DuplicateUiResponse::No:
+			return ConcurrentUiInstanceAction::KillPrevious;
+		default:
+			return ShowConcurrentUiInstanceDialog_();
+		}
+	}
+
+	int HandleConcurrentUiInstance_(std::string_view uiMutexName, p2c::cli::DuplicateUiResponse response)
+	{
+		if (MakeConcurrentUiInstanceAction_(response) == ConcurrentUiInstanceAction::KillPrevious) {
+			if (p2c::client::util::TerminateUiInstanceProcessTree(uiMutexName)) {
+				return 0;
+			}
+			if (response == p2c::cli::DuplicateUiResponse::No) {
+				pmlog_warn("Unable to close the previous Intel PresentMon instance");
+				return p2c::client::util::UiAlreadyRunningExitCode;
+			}
+			MessageBoxW(nullptr,
+				L"Unable to close the previous Intel PresentMon instance.",
+				L"Intel PresentMon",
+				MB_ICONERROR | MB_APPLMODAL | MB_SETFOREGROUND);
+			return p2c::client::util::UiAlreadyRunningExitCode;
+		}
+
+		p2c::client::util::BringUiBrowserWindowToFront(uiMutexName);
+		return p2c::client::util::UiAlreadyRunningExitCode;
+	}
+
+	class KillOnCloseJob
+	{
+	public:
+		KillOnCloseJob(HANDLE hProcess)
+			:
+			hJob_{ CreateJobObjectW(nullptr, nullptr) }
+		{
+			if (!hJob_) {
+				pmlog_warn("failed to create UI process job object").hr();
+				return;
+			}
+
+			JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits{};
+			limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+			if (!SetInformationJobObject(
+				hJob_.Get(), JobObjectExtendedLimitInformation, &limits, sizeof(limits))) {
+				pmlog_warn("failed to configure UI process job object").hr();
+				hJob_.Clear();
+				return;
+			}
+
+			if (!AssignProcessToJobObject(hJob_.Get(), hProcess)) {
+				pmlog_warn("failed to attach UI process to job object").hr();
+				hJob_.Clear();
+			}
+		}
+
+	private:
+		::pmon::util::win::Handle hJob_;
+	};
+
+#ifndef NDEBUG
+	BOOL CALLBACK LogOutputMonitorCoordinatesCallback_(HMONITOR, HDC, LPRECT pMonitorRect, LPARAM pUserData)
+	{
+		auto& outputIndex = *reinterpret_cast<int*>(pUserData);
+		const auto width = pMonitorRect->right - pMonitorRect->left;
+		const auto height = pMonitorRect->bottom - pMonitorRect->top;
+
+		pmlog_dbg(std::format("Output monitor [{}] window space: left={} right={} top={} bottom={} width={} height={}",
+			outputIndex,
+			pMonitorRect->left,
+			pMonitorRect->right,
+			pMonitorRect->top,
+			pMonitorRect->bottom,
+			width,
+			height));
+		++outputIndex;
+		return TRUE;
+	}
+
+	void LogOutputMonitorCoordinates_()
+	{
+		int outputIndex = 0;
+		if (!EnumDisplayMonitors(nullptr, nullptr, LogOutputMonitorCoordinatesCallback_, reinterpret_cast<LPARAM>(&outputIndex))) {
+			pmlog_warn("failed to enumerate output monitors").hr();
+		}
+		else if (outputIndex == 0) {
+			pmlog_warn("no output monitors enumerated");
+		}
+	}
+#endif
 }
 
 int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdShow)
@@ -124,6 +241,8 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLi
 #endif
 
 	try {
+		util::log::IdentificationTable::AddThisProcess("kproc");
+		util::log::IdentificationTable::AddThisThread("main");
 		// if we were run from a parent with a console (terminal?), try to attach there
 		const bool fromTerminal = TryAttachToParentConsole_();
 		// parse the command line arguments and make them globally available
@@ -152,6 +271,9 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLi
 			return *err;
 		}
 		const auto& opt = cli::Options::Get();
+		if (opt.logFolder) {
+			infra::util::FolderResolver::SetLogPathOverride(util::str::ToWide(*opt.logFolder));
+		}
 		// do some post validation here
 		if (opt.subcCapture.Active()) {
 			// make sure target is specified
@@ -166,6 +288,42 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLi
 				std::cerr << "Must specify one of --metrics or --devices for list" << std::endl;
 				return -1;
 			}
+		}
+		if (opt.subcShow.Active()) {
+			if (!opt.showVerboseModules && !opt.showVerboseBitset && !opt.showLogFolder) {
+				std::cerr << "Must specify one of --log-folder, --verbose-modules, or --verbose-bitset for show" << std::endl;
+				return -1;
+			}
+			if (opt.showLogFolder) {
+				const auto logPath = infra::util::FolderResolver::Get().ResolveLogPath();
+				std::error_code ec;
+				std::filesystem::create_directories(logPath, ec);
+				if (ec) {
+					std::cerr << "Failed to create log folder: " << logPath << std::endl;
+					return -1;
+				}
+				util::win::ExplorePath(logPath);
+			}
+			if (opt.showVerboseModules) {
+				for (int i = 0; i < int(util::log::V::Count); i++) {
+					std::cout << util::log::GetVerboseModuleName(util::log::V(i)) << "\n";
+				}
+			}
+			if (opt.showVerboseBitset) {
+				const auto verboseModuleMap = util::log::GetVerboseModuleMapNarrow();
+				uint64_t verboseBitset = 0;
+				for (const auto& moduleNameRaw : *opt.showVerboseBitset) {
+					const auto moduleName = util::str::ToLower(moduleNameRaw);
+					const auto it = verboseModuleMap.find(moduleName);
+					if (it == verboseModuleMap.end() || it->second == util::log::V::Count) {
+						std::cerr << std::format("Unknown verbose module '{}'", moduleNameRaw) << std::endl;
+						return -1;
+					}
+					verboseBitset |= (1ull << uint64_t(it->second));
+				}
+				std::cout << std::format("0x{:X}", verboseBitset) << std::endl;
+			}
+			return 0;
 		}
 		// pause process to allow for attaching debugger
 		if (opt.waitForDebugger) {
@@ -189,12 +347,22 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLi
 		// configure the logging system (partially based on command line options)
 		ConfigureLogging();
 
+#ifndef NDEBUG
+		LogOutputMonitorCoordinates_();
+#endif
+
 		// determine if we're running headless
 		const bool headless = opt.subcCapture.Active() || opt.subcList.Active();
 
 		// pipe logging into stdio when running headless
 		if (headless) {
 			ConfigureHeadlessLogging();
+		}
+		else if (p2c::client::util::IsUiBrowserProcessActive(*opt.uiMutexName)) {
+			pmlog_warn("UI browser process already active; handling duplicate UI launch action");
+			if (const auto duplicateResult = HandleConcurrentUiInstance_(*opt.uiMutexName, *opt.duplicateUiResponse)) {
+				return duplicateResult;
+			}
 		}
 
 		// set the app id so that windows get grouped
@@ -213,8 +381,7 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLi
 			// compile fixed CLI options
 			auto args = std::vector<std::string>{
 				"--control-pipe"s, *opt.controlPipe,
-				"--nsm-prefix"s, "pm-frame-nsm"s,
-				"--intro-nsm"s, *opt.shmName,
+				"--shm-name-prefix"s, *opt.shmNamePrefix,
 				"--etw-session-name"s, *opt.etwSessionName,
 				"--log-level"s, util::log::GetLevelName(util::log::GlobalPolicy::Get().GetLogLevel()),
 				"--log-pipe-name"s, logSvcPipe,
@@ -226,9 +393,16 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLi
 				args.append_range(*opt.logVerboseModules | vi::transform(util::log::GetVerboseModuleName));
 			}
 			// launch service child process
-			svcChild = bp2::windows::default_launcher{}(ioctx, "PresentMonService.exe"s, std::move(args));
+			// WORKAROUND: keep a relative exe name while forcing install-dir cwd for child startup.
+			// Remove this when our Boost.Process version no longer breaks cli args for absolute exe paths.
+			{
+				::pmon::util::file::ScopedWorkingDirectory setInstallWorkingDirectory{
+					infra::util::FolderResolver::ResolveInstallPath()
+				};
+				svcChild = bp2::windows::default_launcher{}(ioctx, "PresentMonService.exe"s, std::move(args));
+			}
 			// wait for pipe availability of service api
-			if (!::pmon::util::win::WaitForNamedPipe(*opt.controlPipe + "-in", 1500)) {
+			if (!::pmon::util::win::WaitForNamedPipe(*opt.controlPipe + "-in", 1500000)) {
 				pmlog_error("timeout waiting for child service control pipe to go online");
 				return -1;
 			}
@@ -311,10 +485,11 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLi
 			}
 			// list adapter devices
 			if (opt.listDevices) {
-				std::cout << "List of graphics adapters:\n";
+				std::cout << "List of queryable devices:\n";
 				for (auto&& d : pIntro->GetDevices()) {
-					if (!d.GetId()) continue;
-					std::cout << d.GetName() << " [" << d.GetId() << "] (" << d.IntrospectVendor().GetName() << ")\n";
+					std::cout << d.GetName() << " [" << d.GetId() << "] "
+						<< d.IntrospectVendor().GetName()
+						<< " (" << d.IntrospectType().GetName() << ")\n";
 				}
 			}
 			return 0;
@@ -349,67 +524,91 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLi
 		pKernel = &kernel;
 		// run the UI when not headless
 		if (!headless) {
-			// compose optional cli args for cef process tree
-			auto args = std::vector<std::string>{
-				opt.filesWorking ? "--p2c-files-working"s : ""s,
-				opt.traceExceptions ? "--p2c-trace-exceptions"s : ""s,
-				opt.logFolder ? "--p2c-log-folder"s : ""s, *opt.logFolder,
-			} | vi::filter(std::not_fn(&std::string::empty)) | rn::to<std::vector>();
-			// forward verbose module options
-			if (opt.logVerboseModules) {
-				args.push_back("--p2c-log-verbose-modules"s);
-				args.append_range(*opt.logVerboseModules | vi::transform(util::log::GetVerboseModuleName));
-			}
-			bool allOriginsAllowed = false;
-			for (auto& f : *opt.uiFlags) {
-				if (f == "enable-chromium-debug") {
-					// needed in order to connect Chrome debuggers to CEF
-					args.push_back("--remote-allow-origins=*");
-					allOriginsAllowed = true;
+			uint64_t uiLaunchAttempt = 0;
+			for (;;) {
+				// compose optional cli args for cef process tree
+				auto args = std::vector<std::string>{
+					opt.filesWorking ? "--p2c-files-working"s : ""s,
+					opt.traceExceptions ? "--p2c-trace-exceptions"s : ""s,
+					opt.logFolder ? "--p2c-log-folder"s : ""s, *opt.logFolder,
+				} | vi::filter(std::not_fn(&std::string::empty)) | rn::to<std::vector>();
+				// forward verbose module options
+				if (opt.logVerboseModules) {
+					args.push_back("--p2c-log-verbose-modules"s);
+					args.append_range(*opt.logVerboseModules | vi::transform(util::log::GetVerboseModuleName));
 				}
-				args.push_back("--p2c-" + f);
-			}
-			for (auto& o : *opt.uiOptions) {
-				if (o.first == "url" && is_debug && !allOriginsAllowed) {
-					// needed in order to connect Chrome debuggers to CEF
-					args.push_back("--remote-allow-origins=*");
-				}
-				args.push_back("--p2c-" + o.first);
-				args.push_back(o.second);
-			}
-			const auto cefLogPipe = std::format("pm-ui-log-{}", GetCurrentProcessId());
-			// add fixed CLI options to the args vector
-			args.append_range(std::vector{
-				"--p2c-log-level"s, util::log::GetLevelName(*opt.logLevel),
-				"--p2c-log-trace-level"s, util::log::GetLevelName(*opt.logTraceLevel),
-				"--p2c-act-name"s, actName,
-				"--p2c-log-pipe-name"s, cefLogPipe
-			});
-			// launch the CEF browser process, which in turn launches all the other processes in the CEF process constellation
-			auto cefChild = [&] {
-				if (util::win::WeAreElevated()) {
-					try {
-						pmlog_info("detected elevation, attempting integrity downgrade");
-						auto mediumTokenPack = util::win::PrepareMediumIntegrityToken();
-						return bp2::windows::as_user_launcher{ mediumTokenPack.hMediumToken.Get() }(
-							ioctx, "PresentMonUI.exe"s, args
-							);
+				bool allOriginsAllowed = false;
+				for (auto& f : *opt.uiFlags) {
+					if (f == "enable-chromium-debug") {
+						// needed in order to connect Chrome debuggers to CEF
+						args.push_back("--remote-allow-origins=*");
+						allOriginsAllowed = true;
 					}
-					catch (...) {
-						pmlog_warn(util::ReportException("Failed to downgrade integrity, falling back to standard process spawn"));
-					}
+					args.push_back("--p2c-" + f);
 				}
-				return bp2::windows::default_launcher{}(
-					ioctx, "PresentMonUI.exe"s, args
-					);
-			}();
+				for (auto& o : *opt.uiOptions) {
+					if (o.first == "url" && is_debug && !allOriginsAllowed) {
+						// needed in order to connect Chrome debuggers to CEF
+						args.push_back("--remote-allow-origins=*");
+					}
+					args.push_back("--p2c-" + o.first);
+					args.push_back(o.second);
+				}
+				const auto cefLogPipe = std::format("pm-ui-log-{}-{}", GetCurrentProcessId(), uiLaunchAttempt++);
+				// add fixed CLI options to the args vector
+				args.append_range(std::vector{
+					"--p2c-log-level"s, util::log::GetLevelName(*opt.logLevel),
+					"--p2c-log-trace-level"s, util::log::GetLevelName(*opt.logTraceLevel),
+					"--p2c-ui-mutex-name"s, *opt.uiMutexName,
+					"--p2c-act-name"s, actName,
+					"--p2c-log-pipe-name"s, cefLogPipe
+				});
+				// launch the CEF browser process, which in turn launches all the other processes in the CEF process constellation
+				auto cefChild = [&] {
+					// WORKAROUND: keep a relative exe name while forcing install-dir cwd for child startup.
+					// Remove this when our Boost.Process version no longer breaks cli args for absolute exe paths.
+					::pmon::util::file::ScopedWorkingDirectory setInstallWorkingDirectory{
+						infra::util::FolderResolver::ResolveInstallPath()
+					};
+					if (util::win::WeAreElevated()) {
+						try {
+							pmlog_info("detected elevation, attempting integrity downgrade");
+							auto mediumTokenPack = util::win::PrepareMediumIntegrityToken();
+							return bp2::windows::as_user_launcher{ mediumTokenPack.hMediumToken.Get() }(
+								ioctx, "PresentMonUI.exe"s, args
+								);
+						}
+						catch (...) {
+							pmlog_warn(util::ReportException("Failed to downgrade integrity, falling back to standard process spawn"));
+						}
+					}
+					return bp2::windows::default_launcher{}(
+						ioctx, "PresentMonUI.exe"s, args
+						);
+				}();
 
-			// connect logging to the CEF process constellation
-			ConnectToLoggingSourcePipe(cefLogPipe);
+				KillOnCloseJob uiJob{ cefChild.native_handle() };
 
-			// don't exit this process until the CEF control panel exits
-			cefChild.wait();
+				// connect logging to the CEF process constellation
+				ConnectToLoggingSourcePipe(cefLogPipe);
+
+				// don't exit this process until the CEF control panel exits
+				const auto cefExitCode = cefChild.wait();
+				if (cefExitCode == p2c::client::util::UiAlreadyRunningExitCode) {
+					pmlog_warn("UI client reported existing browser process; handling duplicate UI launch action");
+					if (const auto duplicateResult = HandleConcurrentUiInstance_(*opt.uiMutexName, *opt.duplicateUiResponse)) {
+						return duplicateResult;
+					}
+					continue;
+				}
+				if (cefExitCode != 0) {
+					pmlog_warn(std::format("UI client exited with code {}", cefExitCode));
+					return cefExitCode;
+				}
+				break;
+			}
 		}
+		// TODO: organize headless CLI code into own source modules
 		else if (opt.subcCapture.Active()) {
 			DWORD pid;
 			if (opt.capTargetPid) {
@@ -448,6 +647,9 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLi
 				.telemetrySamplingPeriodMs = *opt.capTelemetryPeriod,
 				.hideAlways = true,
 			});
+			if (opt.capDefaultAdapterId && *opt.capDefaultAdapterId > 0) {
+				pSpec->frameQueryAdapterId = *opt.capDefaultAdapterId;
+			}
 			std::cout << "Starting capture..." << std::endl;
 			kernel.PushSpec(std::move(pSpec));
 			kernel.SetCapture(true);
@@ -481,10 +683,9 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLi
 				}
 			}
 			else { // wait indefinitely until %q command received or kernel signal
-				auto res = util::win::WaitAnyEvent(
+				if (util::win::WaitAnyEvent(
 					dynamic_cast<HeadlessKernelHandler*>(pKernelHandler.get())->stopEvent_,
-					stopCommandEvent);
-				if (res && *res == 1) {
+					stopCommandEvent) == 1) {
 					std::cerr << "Capture terminated by %q command." << std::endl;
 				}
 				else {

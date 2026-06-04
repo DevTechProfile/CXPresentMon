@@ -3,10 +3,10 @@
 #pragma once
 #include <string>
 #include <format>
-#include "igcl_api.h"
+#include "igcl/igcl_api.h"
 #include "../CommonUtilities/log/Log.h"
 
-namespace pwr::log
+namespace pmon::tel::log
 {
     inline std::string MakeErrorLocationString(int line, const char* file, const char* function)
     {
@@ -19,5 +19,4 @@ namespace pwr::log
     }
 }
 
-#define IGCL_ERR(ec) pmlog_error("IGCL").code(ec);
-#define TELE_ERR(msg) OutputDebugStringA(pwr::log::MakeTelemetryDebugErrorString((msg), __LINE__, __FILE__, __FUNCTION__).c_str())
+#define TELE_ERR(msg) pmlog_error(msg)

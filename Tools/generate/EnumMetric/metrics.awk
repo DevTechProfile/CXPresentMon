@@ -7,6 +7,7 @@ BEGIN{
 }
 {
     n = split($1, a, ",")
+    sub(/^\357\273\277/, "", a[1])
 
     #printf "\n%u:%u: ", NF, n
     #for (i = 1; i <= n; ++i) printf "|%s", a[i]
@@ -16,6 +17,7 @@ BEGIN{
 
     if (a[1] == "") next
     if (substr(a[1], 1, 2) == "//") next
+    if (substr(a[1], 1, 10) != "PM_METRIC_") next
 
     if (NF == 1) {
         name = a[3]
@@ -29,7 +31,6 @@ BEGIN{
     gsub(/ /, "", shortname)
     gsub(/-/, "", shortname)
 
-    if (shortname == "ProcessID") next
     if (shortname == "VideoBusy") next
 
     printf " \\\n\t\tX_(METRIC, %s, \"%s\", \"%s\", \"%s\")", substr(a[1], 11), name, shortname, desc

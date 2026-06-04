@@ -1,13 +1,15 @@
-// Copyright (C) 2022 Intel Corporation
+﻿// Copyright (C) 2022 Intel Corporation
 // SPDX-License-Identifier: MIT
 #include "NanoCefBrowserClient.h"
 #include "NanoCefProcessHandler.h"
 #include "../resource.h"
 #include "util/Logging.h"
 #include "util/LogSetup.h"
+#include "util/UiProcessGuard.h"
 #include <Core/source/infra/util/FolderResolver.h>
 #include "util/CliOptions.h"
 #include <CommonUtilities/log/IdentificationTable.h>
+#include <CommonUtilities/str/String.h>
 #include <Versioning/BuildId.h>
 #include <CommonUtilities/win/Utilities.h>
 #include <dwmapi.h>
@@ -180,6 +182,9 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLi
     if (opt.filesWorking) {
         infra::util::FolderResolver::SetDevMode();
     }
+    if (opt.logFolder) {
+        infra::util::FolderResolver::SetLogPathOverride(str::ToWide(*opt.logFolder));
+    }
 
     // create logging system and ensure cleanup before main ext
     client::util::LogChannelManager zLogMan_;
@@ -194,7 +199,7 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLi
     }
 
     // name this process / thread
-    log::IdentificationTable::AddThisProcess(opt.cefType.AsOptional().value_or("main-client"));
+    log::IdentificationTable::AddThisProcess("cef-" + opt.cefType.AsOptional().value_or("mclient"));
     log::IdentificationTable::AddThisThread("main");
 
     // initialize the logging system
@@ -217,6 +222,13 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLi
         }
 
         // code from here on is only executed by the root process (browser window process)
+        auto uiInstanceMutex = client::util::TryAcquireUiBrowserProcessMutex(*opt.uiMutexName);
+        if (!uiInstanceMutex.first) {
+            return -1;
+        }
+        if (!uiInstanceMutex.second) {
+            return client::util::UiAlreadyRunningExitCode;
+        }
 
         pmlog_info(std::format("== UI client root process starting build#{} clean:{} CEF:{} ==",
             BuildIdShortHash(), !BuildIdDirtyFlag(), CEF_VERSION));
@@ -229,16 +241,19 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLi
             settings.remote_debugging_port = is_debug || opt.enableChromiumDebug ? 9009 : 0;
             settings.background_color = CefColorSetARGB(255, 0, 0, 0);
             CefString(&settings.cache_path).FromWString(folderResolver.Resolve(infra::util::FolderResolver::Folder::App, L"cef-cache"));
-            if (opt.logFolder) {
-                CefString(&settings.log_file).FromString(*opt.logFolder + "\\cef-debug.log");
+            const auto logFilePath = folderResolver.ResolveLogPath("cef-debug.log");
+            CefString(&settings.log_file).FromWString(logFilePath.wstring());
+            const auto logLevel = util::log::GlobalPolicy::Get().GetLogLevel();
+            auto cefLogSeverity = ToCefLogLevel(logLevel);
+            if (logLevel == util::log::Level::Verbose &&
+                !util::log::GlobalPolicy::Get().CheckVerboseModule(util::log::V::chrome)) {
+                cefLogSeverity = ToCefLogLevel(util::log::Level::Debug);
             }
-            else {
-                CefString(&settings.log_file).FromWString(folderResolver.Resolve(infra::util::FolderResolver::Folder::App, L"logs\\cef-debug.log"));
-            }
-            settings.log_severity = ToCefLogLevel(util::log::GlobalPolicy::Get().GetLogLevel());
+            settings.log_severity = cefLogSeverity;
             CefInitialize(main_args, settings, app.get(), nullptr);
         }
         auto hwndBrowser = CreateBrowserWindow(hInstance, nCmdShow);
+        client::util::SetUiBrowserWindowMutexSuffix(hwndBrowser, *opt.uiMutexName);
         hwndAppMsg = CreateMessageWindow(hInstance);
 
 
@@ -250,6 +265,7 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLi
 
         DestroyWindow(hwndAppMsg);
         CefShutdown();
+        client::util::ClearUiBrowserWindowMutexSuffix(hwndBrowser);
         DestroyWindow(hwndBrowser);
 
         UnregisterClass(BrowserWindowClassName, hInstance);
