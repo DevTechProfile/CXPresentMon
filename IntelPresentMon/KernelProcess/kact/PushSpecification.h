@@ -98,6 +98,8 @@ namespace ACT_NS
             Color borderColor;
             Color textColor;
             float textSize;
+            bool labelIncludeDeviceId = false;
+            bool labelIncludeDeviceName = false;
 
             template<class A> void serialize(A& ar) {
                 ar(CEREAL_NVP(metrics),
@@ -111,7 +113,9 @@ namespace ACT_NS
                     CEREAL_NVP(backgroundColor),
                     CEREAL_NVP(borderColor),
                     CEREAL_NVP(textColor),
-                    CEREAL_NVP(textSize));
+                    CEREAL_NVP(textSize),
+                    CEREAL_NVP(labelIncludeDeviceId),
+                    CEREAL_NVP(labelIncludeDeviceName));
             }
         };
 
@@ -123,13 +127,17 @@ namespace ACT_NS
             float fontSize;
             Color fontColor;
             Color backgroundColor;
+            bool labelIncludeDeviceId = false;
+            bool labelIncludeDeviceName = false;
 
             template<class A> void serialize(A& ar) {
                 ar(CEREAL_NVP(metrics),
                     CEREAL_NVP(showLabel),
                     CEREAL_NVP(fontSize),
                     CEREAL_NVP(fontColor),
-                    CEREAL_NVP(backgroundColor));
+                    CEREAL_NVP(backgroundColor),
+                    CEREAL_NVP(labelIncludeDeviceId),
+                    CEREAL_NVP(labelIncludeDeviceName));
             }
         };
 
@@ -148,6 +156,7 @@ namespace ACT_NS
                 bool enableCaptureDuration;
                 bool hideDuringCapture;
                 bool hideAlways;
+                bool enablePerMetricDeviceSelection = true;
                 bool independentWindow;
                 uint32_t metricPollRate;
                 uint32_t overlayDrawRate;
@@ -186,18 +195,6 @@ namespace ACT_NS
                 float upscaleFactor;
                 std::optional<int> adapterId; // Uncertain: may be a different type in your system.
 
-                bool enableFlashInjection;
-                bool flashInjectionEnableTargetOverride;
-                std::string flashInjectionTargetOverride;
-                float flashInjectionSize;
-                Color flashInjectionColor;
-                bool flashInjectionBackgroundEnable;
-                Color flashInjectionBackgroundColor;
-                float flashInjectionRightShift;
-                float flashInjectionFlashDuration;
-                bool flashInjectionUseRainbow;
-                float flashInjectionBackgroundSize;
-
                 template<class A> void serialize(A& ar) {
                     ar(CEREAL_NVP(capturePath),
                         CEREAL_NVP(captureDelay),
@@ -206,6 +203,7 @@ namespace ACT_NS
                         CEREAL_NVP(enableCaptureDuration),
                         CEREAL_NVP(hideDuringCapture),
                         CEREAL_NVP(hideAlways),
+                        CEREAL_NVP(enablePerMetricDeviceSelection),
                         CEREAL_NVP(independentWindow),
                         CEREAL_NVP(metricPollRate),
                         CEREAL_NVP(overlayDrawRate),
@@ -231,18 +229,7 @@ namespace ACT_NS
                         CEREAL_NVP(enableTargetBlocklist),
                         CEREAL_NVP(enableAutotargetting),
                         CEREAL_NVP(upscaleFactor),
-                        CEREAL_NVP(adapterId),
-                        CEREAL_NVP(enableFlashInjection),
-                        CEREAL_NVP(flashInjectionEnableTargetOverride),
-                        CEREAL_NVP(flashInjectionTargetOverride),
-                        CEREAL_NVP(flashInjectionSize),
-                        CEREAL_NVP(flashInjectionColor),
-                        CEREAL_NVP(flashInjectionBackgroundEnable),
-                        CEREAL_NVP(flashInjectionBackgroundColor),
-                        CEREAL_NVP(flashInjectionRightShift),
-                        CEREAL_NVP(flashInjectionFlashDuration),
-                        CEREAL_NVP(flashInjectionUseRainbow),
-                        CEREAL_NVP(flashInjectionBackgroundSize));
+                        CEREAL_NVP(adapterId));
                 }
             } preferences;
 
@@ -274,27 +261,11 @@ namespace ACT_NS
 
         static Response Execute_(const ACT_EXEC_CTX& ctx, SessionContext& stx, Params&& in)
         {
-            const GfxLayer::Extension::OverlayConfig cfg{
-                .BarSize = in.preferences.flashInjectionSize,
-                .BarRightShift = in.preferences.flashInjectionRightShift,
-                .BarColor = in.preferences.flashInjectionColor.AsArray(),
-                .RenderBackground = in.preferences.flashInjectionBackgroundEnable,
-                .BackgroundColor = in.preferences.flashInjectionBackgroundColor.AsArray(),
-                .FlashDuration = in.preferences.flashInjectionFlashDuration,
-                .UseRainbow = in.preferences.flashInjectionUseRainbow,
-                .BackgroundSize = in.preferences.flashInjectionBackgroundSize,
-            };
-
-            const auto flashTgtOverride = in.preferences.flashInjectionEnableTargetOverride ?
-                std::optional{ in.preferences.flashInjectionTargetOverride } : std::nullopt;
-
-            (*ctx.ppKernel)->UpdateInjection(in.preferences.enableFlashInjection, in.pid, flashTgtOverride, cfg);
-
             if (!in.pid) {
                 (*ctx.ppKernel)->ClearOverlay();
             }
             else {
-                (*ctx.ppKernel)->PushSpec(MakeOverlaySpec(in));
+                (*ctx.ppKernel)->PushSpec(MakeOverlaySpec(in, (*ctx.ppKernel)->GetIntrospectionRoot()));
             }
 
             // (No useful response fields; logging the request is typically what you want here.)

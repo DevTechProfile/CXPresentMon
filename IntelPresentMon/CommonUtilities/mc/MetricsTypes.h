@@ -1,4 +1,4 @@
-﻿// Copyright (C) 2025 Intel Corporation
+// Copyright (C) 2025 Intel Corporation
 // SPDX-License-Identifier: MIT
 #pragma once
 #include <cmath>
@@ -6,8 +6,10 @@
 #include <limits>
 #include <memory>
 #include <optional>
+#include <array>
 #include "../cnr/FixedVector.h"
 #include <PresentData/PresentEventEnums.hpp>
+#include <PresentData/InterPresentActivity.hpp>
 
 // Forward declarations for external types
 struct PresentEvent; // From PresentMonTraceConsumer
@@ -84,10 +86,16 @@ namespace pmon::util::metrics {
         uint64_t flipDelay = 0;
         uint32_t flipToken = 0;
 
+        std::array<InterPresentActivity::FrameStats, (size_t)InterPresentActivity::Kind::Count> interFrameEventStats{};
+        uint64_t interFrameEventWindowQpc = 0;
+
         // Extra present parameters obtained through DXGI or D3D9 present
         uint64_t swapChainAddress = 0;
         int32_t syncInterval = 0;
         uint32_t presentFlags = 0;
+
+        uint64_t vidPnLayerId = 0;
+        uint64_t presentId = 0;
 
         // Metadata
         PresentResult finalState = {};
@@ -127,6 +135,8 @@ namespace pmon::util::metrics {
         uint64_t screenTimeQpc = 0;
         double msReadyTimeToDisplayLatency = MissingFrameMetricValue();
         bool isDroppedFrame = false;
+        std::pair<uint32_t, uint32_t> displayId = {}; // {vidPnSourceId, layerIndex}
+        uint64_t presentId = 0;
 
         // CPU Metrics (app frames only)
         double msCPUBusy = 0;
@@ -160,6 +170,10 @@ namespace pmon::util::metrics {
         // PCLatency (optional)
         double msFlipDelay = MissingFrameMetricValue();  // NVIDIA
 
+        uint64_t psoCompileCount = 0;
+        double msPsoCompileTime = 0;
+        double psoCompileBusyPercent = 0;
+
         // Frame Classification
         FrameType frameType = {};
 
@@ -171,5 +185,27 @@ namespace pmon::util::metrics {
         uint32_t presentFlags = 0;
         bool allowsTearing = false;
         PresentMode presentMode = {};
+    };
+
+    struct AnimationDisplayContext {
+        double msAnimationError = MissingFrameMetricValue();
+        double msAnimationTime = MissingFrameMetricValue();
+        AnimationErrorSource source = AnimationErrorSource::CpuStart;
+        uint64_t resolvedSimStartTime = 0;
+        uint64_t firstSimStartTime = 0;
+        bool hasResolvedSimStart = false;
+    };
+
+    struct ReadyDisplayRow {
+        FrameData present;
+        size_t displayIndex = 0;
+        uint64_t previousDisplayedScreenTime = 0;
+        uint64_t screenTime = 0;
+        uint64_t nextScreenTime = 0;
+        bool isDisplayed = false;
+        bool isAppFrame = false;
+        bool updateSwapChainAfterRow = true;
+        FrameType frameType = FrameType::NotSet;
+        AnimationDisplayContext animation;
     };
 }

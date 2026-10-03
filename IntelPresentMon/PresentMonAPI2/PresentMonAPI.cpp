@@ -7,6 +7,7 @@
 #include "Internal.h"
 #include "PresentMonAPI.h"
 #include "PresentMonDiagnostics.h"
+#include "../CommonUtilities/test/CrtDiagnosticsRedirect.h"
 #include "../PresentMonMiddleware/LogSetup.h"
 #include "../Versioning/PresentMonAPIVersion.h"
 #include <ranges>
@@ -24,6 +25,9 @@ bool useCrtHeapDebug_ = false;
 // map handles (session, query, introspection) to middleware instances
 std::unordered_map<const void*, std::shared_ptr<Middleware>> handleMap_;
 std::shared_ptr<pmon::util::log::IIdentificationSink> pLinkedIdTableSink_;
+pmon::util::log::HostLogEntryForwardFn pLinkedLogForwardFn_ = nullptr;
+PmIdAddThreadFn pLinkedIdForwardAddThreadFn_ = nullptr;
+PmIdAddProcessFn pLinkedIdForwardAddProcessFn_ = nullptr;
 const auto DescribePointerArg_ = []<typename T>(const T* p, bool dereferenceScalar = true) -> std::string
 {
 	if (!p) {
@@ -100,69 +104,126 @@ PRESENTMON_API2_EXPORT _CrtMemState pmCreateHeapCheckpoint_()
 	return s;
 }
 
+namespace
+{
+	pmon::util::log::GlobalPolicy& GetMiddlewareGlobalPolicy_()
+	{
+		return pmon::util::log::GlobalPolicy::Get();
+	}
+
+	pmon::util::log::LineTable& GetMiddlewareLineTable_()
+	{
+		return pmon::util::log::LineTable::Get_();
+	}
+
+	LoggingSingletons LinkLogging_(pmon::util::log::IChannel* pChannel,
+		pmon::util::log::IdentificationTable* pExeTable,
+		pmon::util::log::HostLogEntryForwardFn forwardLogEntryFn,
+		PmIdAddThreadFn forwardAddThreadFn,
+		PmIdAddProcessFn forwardAddProcessFn)
+	{
+		using namespace pmon::util::log;
+		pLinkedLogForwardFn_ = forwardLogEntryFn;
+		pLinkedIdForwardAddThreadFn_ = forwardAddThreadFn;
+		pLinkedIdForwardAddProcessFn_ = forwardAddProcessFn;
+		SetupCopyChannel(pChannel, forwardLogEntryFn);
+		if (pLinkedIdTableSink_) {
+			IdentificationTable::UnregisterSink(pLinkedIdTableSink_.get());
+			pLinkedIdTableSink_.reset();
+		}
+		if (pExeTable) {
+			class Sink : public IIdentificationSink
+			{
+			public:
+				Sink(IdentificationTable* pTable, PmIdAddThreadFn addThreadFn,
+					PmIdAddProcessFn addProcessFn) noexcept
+					:
+					pTable_{ pTable },
+					addThreadFn_{ addThreadFn },
+					addProcessFn_{ addProcessFn }
+				{}
+				void AddThread(uint32_t tid, uint32_t pid, std::string name) override
+				{
+					if (addThreadFn_) {
+						addThreadFn_(pTable_, tid, pid, name.c_str(), name.size());
+					}
+					else {
+						pTable_->AddThread_(tid, pid, std::move(name));
+					}
+				}
+				void AddProcess(uint32_t pid, std::string name) override
+				{
+					if (addProcessFn_) {
+						addProcessFn_(pTable_, pid, name.c_str(), name.size());
+					}
+					else {
+						pTable_->AddProcess_(pid, std::move(name));
+					}
+				}
+			private:
+				IdentificationTable* pTable_;
+				PmIdAddThreadFn addThreadFn_;
+				PmIdAddProcessFn addProcessFn_;
+			};
+			pLinkedIdTableSink_ = std::make_shared<Sink>(pExeTable, forwardAddThreadFn, forwardAddProcessFn);
+			IdentificationTable::RegisterSink(pLinkedIdTableSink_);
+			const auto bulk = IdentificationTable::GetBulk();
+			for (auto& t : bulk.threads) {
+				if (forwardAddThreadFn) {
+					forwardAddThreadFn(pExeTable, t.tid, t.pid, t.name.c_str(), t.name.size());
+				}
+				else {
+					pLinkedIdTableSink_->AddThread(t.tid, t.pid, t.name);
+				}
+			}
+			for (auto& p : bulk.processes) {
+				if (forwardAddProcessFn) {
+					forwardAddProcessFn(pExeTable, p.pid, p.name.c_str(), p.name.size());
+				}
+				else {
+					pLinkedIdTableSink_->AddProcess(p.pid, p.name);
+				}
+			}
+		}
+		return {
+			.getGlobalPolicy = &GetMiddlewareGlobalPolicy_,
+			.getLineTable = &GetMiddlewareLineTable_,
+		};
+	}
+}
+
+PRESENTMON_API2_EXPORT LoggingSingletons pmLinkLoggingPtrs_(
+	pmon::util::log::IChannel* pChannel,
+	pmon::util::log::IdentificationTable* pExeTable,
+	PmLogEntryForwardFn forwardLogEntryFn,
+	PmIdAddThreadFn forwardAddThreadFn,
+	PmIdAddProcessFn forwardAddProcessFn) noexcept
+{
+	pmon::util::test::MaybeInstallCrtAssertRedirect();
+	return LinkLogging_(pChannel, pExeTable, forwardLogEntryFn, forwardAddThreadFn, forwardAddProcessFn);
+}
+
 PRESENTMON_API2_EXPORT LoggingSingletons pmLinkLogging_(
 	std::shared_ptr<pmon::util::log::IChannel> pChannel,
-	pmon::util::log::IdentificationTableCallbacks idTableCallbacks)
+	std::function<pmon::util::log::IdentificationTable&()> getIdTable)
 {
-	using namespace util::log;
-	// set api dll default logging channel to copy to exe logging channel
-	SetupCopyChannel(std::move(pChannel));
-	// connecting id tables (dll => exe)
-	if (pLinkedIdTableSink_) {
-		IdentificationTable::UnregisterSink(pLinkedIdTableSink_.get());
-		pLinkedIdTableSink_.reset();
-	}
-	if (idTableCallbacks) {
-		class Sink : public IIdentificationSink
-		{
-		public:
-			Sink(IdentificationTableCallbacks callbacks)
-				:
-				callbacks_{ callbacks }
-			{}
-			void AddThread(uint32_t tid, uint32_t pid, std::string name) override
-			{
-				if (callbacks_.addThread) {
-					callbacks_.addThread(tid, pid, name.c_str());
-				}
-			}
-			void AddProcess(uint32_t pid, std::string name) override
-			{
-				if (callbacks_.addProcess) {
-					callbacks_.addProcess(pid, name.c_str());
-				}
-			}
-		private:
-			IdentificationTableCallbacks callbacks_;
-		};
-		pLinkedIdTableSink_ = std::make_shared<Sink>(idTableCallbacks);
-		// hooking exe table up so that it receives updates
-		IdentificationTable::RegisterSink(pLinkedIdTableSink_);
-		// copying current contents of table to exe
-		const auto bulk = IdentificationTable::GetBulk();
-		for (auto& t : bulk.threads) {
-			pLinkedIdTableSink_->AddThread(t.tid, t.pid, t.name);
-		}
-		for (auto& p : bulk.processes) {
-			pLinkedIdTableSink_->AddProcess(p.pid, p.name);
-		}
-	}
-	// return functions to access the global settings objects
-	return {
-		.getGlobalPolicy = []() -> GlobalPolicy& { return GlobalPolicy::Get(); },
-		.getLineTable = []() -> LineTable& { return LineTable::Get_(); },
-	};
+	pmon::util::log::IdentificationTable* pExeTable = getIdTable ? &getIdTable() : nullptr;
+	return LinkLogging_(pChannel.get(), pExeTable, nullptr, nullptr, nullptr);
 }
 
 PRESENTMON_API2_EXPORT void pmUnlinkLogging_() noexcept
 {
 	using namespace util::log;
-	pmquell(FlushEntryPoint())
-	pmquell(InjectDefaultChannel({}))
 	if (pLinkedIdTableSink_) {
 		pmquell(IdentificationTable::UnregisterSink(pLinkedIdTableSink_.get()))
 		pLinkedIdTableSink_.reset();
 	}
+	pmquell(FlushEntryPoint())
+	pmquell(SeverCopyLoggingBridge())
+	pLinkedLogForwardFn_ = nullptr;
+	pLinkedIdForwardAddThreadFn_ = nullptr;
+	pLinkedIdForwardAddProcessFn_ = nullptr;
+	pmquell(InjectDefaultChannel({}))
 }
 
 PRESENTMON_API2_EXPORT void pmFlushEntryPoint_() noexcept
@@ -173,6 +234,7 @@ PRESENTMON_API2_EXPORT void pmFlushEntryPoint_() noexcept
 PRESENTMON_API2_EXPORT void pmSetupODSLogging_(PM_DIAGNOSTIC_LEVEL logLevel,
 	PM_DIAGNOSTIC_LEVEL stackTraceLevel, bool exceptionTrace)
 {
+	pmon::util::test::MaybeInstallCrtAssertRedirect();
 	pmon::util::log::SetupODSChannel((pmon::util::log::Level)logLevel,
 		(pmon::util::log::Level)stackTraceLevel, exceptionTrace);
 }
@@ -287,7 +349,7 @@ PRESENTMON_API2_EXPORT PM_STATUS pmSetTelemetryPollingPeriod(PM_SESSION_HANDLE h
 {
 	try {
 		pmlog_dbg("pmSetTelemetryPollingPeriod").pmwatch(handle).pmwatch(deviceId).pmwatch(timeMs);
-		LookupMiddleware_(handle).SetTelemetryPollingPeriod(deviceId, timeMs);
+		LookupMiddleware_(handle).SetTelemetryPollingPeriod(deviceId, timeMs ? std::optional{ timeMs } : std::nullopt);
 		return PM_STATUS_SUCCESS;
 	}
 	pmcatch_report_diag(true);

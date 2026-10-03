@@ -5,13 +5,16 @@
 
 namespace pmon::util::log
 {
+	using HostLogEntryForwardFn = void(*)(IChannel*, const Entry&) noexcept;
+
 	class CopyDriver : public IDriver
 	{
 	public:
-		CopyDriver(std::shared_ptr<IChannel> pChannel);
+		CopyDriver(IChannel* pChannel, HostLogEntryForwardFn forwardFn) noexcept;
 		void Submit(const Entry&) override;
 		void Flush() override;
 	private:
-		std::shared_ptr<IChannel> pChannel_;
+		IChannel* pChannel_;
+		HostLogEntryForwardFn forwardFn_;
 	};
 }

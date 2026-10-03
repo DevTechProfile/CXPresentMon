@@ -5,6 +5,8 @@
 #include "../CommonUtilities/test/MachineExpectations.h"
 #include "../PresentMonAPI2Loader/Loader.h"
 #include "../PresentMonAPI2/Internal.h"
+#include "../CommonUtilities/test/CrtDiagnosticsRedirect.h"
+#include "TestDiagnosticsRedirect.h"
 
 using namespace Microsoft::VisualStudio::CppUnitTestFramework;
 namespace fs = std::filesystem;
@@ -24,11 +26,36 @@ void WipeAndRecreate(const fs::path& path)
 	}
 }
 
+void EnsureExists(const fs::path& path)
+{
+	// Create without wiping. Machine expectation measurements accumulate across the
+	// whole suite via std::ios::app, but module initialize runs once per load of this
+	// DLL. CTest registers every test method as its own vstest.console process, so
+	// wiping here would discard the previous test's measurements and leave at most one
+	// test case recorded. Provisioning deletes measurements.jsonl explicitly instead.
+	try {
+		fs::create_directories(path);
+	}
+	catch (const std::exception& ex) {
+		Logger::WriteMessage(std::format("Failed to create folder [{}]: {}\n", path.string(), ex.what()).c_str());
+		throw; // let MSTest see this as a test infrastructure error
+	}
+}
+
 TEST_MODULE_INITIALIZE(Api2TestModuleInit)
 {
-	// initialize c-api setting for in-module operation
+	pmon::test::InstallTestDiagnosticsRedirect();
+	if (pmon::util::test::IsCrtAssertRedirectEnabled()) {
+		try {
+			std::error_code ec;
+			fs::create_directories(pmon::test::agentDiagnosticsFolder_, ec);
+		}
+		catch (...) {
+		}
+	}
 	pmLoaderSetPathToMiddlewareDll_("./PresentMonAPI2.dll");
 	pmSetupODSLogging_(PM_DIAGNOSTIC_LEVEL_DEBUG, PM_DIAGNOSTIC_LEVEL_ERROR, false);
+	pmon::test::ReapplyTestDiagnosticsRedirectIfEnabled();
 	// setup folders
 	WipeAndRecreate(MultiClientTests::logFolder_);
 	WipeAndRecreate(EtlLoggerTests::logFolder_);
@@ -42,8 +69,9 @@ TEST_MODULE_INITIALIZE(Api2TestModuleInit)
 	WipeAndRecreate(InterimBroadcasterTests::logFolder_);
 	WipeAndRecreate(InterimBroadcasterTests::outFolder_);
 	WipeAndRecreate(IpcMcIntegrationTests::logFolder_);
-	WipeAndRecreate(pmon::util::test::MachineExpectationOutputFolder);
+	EnsureExists(pmon::util::test::MachineExpectationOutputFolder);
 	WipeAndRecreate(RealtimeMetricTests::logFolder_);
 	WipeAndRecreate(RealtimeMetricTests::outFolder_);
 	WipeAndRecreate(LoggingTests::logFolder_);
+	WipeAndRecreate(MockTelemetryTests::logFolder_);
 }

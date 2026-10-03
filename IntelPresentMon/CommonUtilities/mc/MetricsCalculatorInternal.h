@@ -1,4 +1,4 @@
-﻿// Copyright (C) 2025 Intel Corporation
+// Copyright (C) 2026 Intel Corporation
 // SPDX-License-Identifier: MIT
 #pragma once
 
@@ -17,6 +17,7 @@ namespace pmon::util::metrics
         const QpcConverter& qpc,
         const FrameData& present,
         const SwapChainCoreState& swapChain,
+        uint64_t previousDisplayedScreenTime,
         bool isDisplayed,
         uint64_t screenTime,
         uint64_t nextScreenTime,
@@ -30,12 +31,7 @@ namespace pmon::util::metrics
         FrameMetrics& metrics);
 
     void CalculateAnimationMetrics(
-        const QpcConverter& qpc,
-        const SwapChainCoreState& swapChain,
-        const FrameData& present,
-        bool isDisplayed,
-        bool isAppFrame,
-        uint64_t screenTime,
+        const AnimationDisplayContext& animation,
         FrameMetrics& metrics);
 
     void CalculateInputLatencyMetrics(
@@ -62,6 +58,12 @@ namespace pmon::util::metrics
         bool isDisplayed,
         bool isAppFrame,
         uint64_t screenTime,
+        FrameMetrics& metrics);
+
+    void CalculateInterFrameEventMetrics(
+        const QpcConverter& qpc,
+        const FrameData& present,
+        bool isAppFrame,
         FrameMetrics& metrics);
 
     // NVIDIA collapsed/runt correction helper used by ComputeMetricsForPresent.

@@ -1,4 +1,4 @@
-// Copyright (C) 2017-2024 Intel Corporation
+// Copyright (C) 2017-2026 Intel Corporation
 // Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved
 // SPDX-License-Identifier: MIT
 
@@ -6,6 +6,7 @@
 
 #include "ETW/Intel_PresentMon.h"
 #include "ETW/Microsoft_Windows_D3D9.h"
+#include "ETW/Microsoft_Windows_Direct3D12.h"
 #include "ETW/Microsoft_Windows_Dwm_Core.h"
 #include "ETW/Microsoft_Windows_Dwm_Core_Win7.h"
 #include "ETW/Microsoft_Windows_DXGI.h"
@@ -53,6 +54,28 @@ static inline bool HasScreenTime(std::shared_ptr<PresentEvent> const& p)
         }
     }
     return false;
+}
+
+static inline bool HasDisplayedFrameType(std::shared_ptr<PresentEvent> const& p, FrameType frameType)
+{
+    for (auto const& displayed : p->Displayed) {
+        if (displayed.first == frameType) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static inline bool ShouldAppendApplicationAfterGeneratedDisplay(std::shared_ptr<PresentEvent> const& p)
+{
+    bool hasGeneratedFrame =
+        HasDisplayedFrameType(p, FrameType::Intel_XEFG) ||
+        HasDisplayedFrameType(p, FrameType::AMD_AFMF);
+
+    bool hasApplicationFrame =
+        HasDisplayedFrameType(p, FrameType::Application);
+
+    return hasGeneratedFrame && !hasApplicationFrame;
 }
 
 // Set a ScreenTime for this present.
@@ -186,6 +209,7 @@ PresentEvent::PresentEvent()
     , WaitingForFlipFrameType(false)
     , DoneWaitingForFlipFrameType(false)
     , WaitingForFrameId(false)
+    , DisplayedViaFlipFrameType(false)
 {
 }
 
@@ -261,6 +285,7 @@ PresentEvent::PresentEvent(uint32_t fid)
     , WaitingForFlipFrameType(false)
     , DoneWaitingForFlipFrameType(false)
     , WaitingForFrameId(false)
+    , DisplayedViaFlipFrameType(false)
 {
 }
 
@@ -323,6 +348,38 @@ void PMTraceConsumer::HandleD3D9Event(EVENT_RECORD* pEventRecord)
         break;
     default:
         assert(!mFilteredEvents); // Assert that filtering is working if expected
+        break;
+    }
+}
+
+void PMTraceConsumer::HandleD3D12Event(EVENT_RECORD* pEventRecord)
+{
+    if (!mTrackD3D12ShaderCompilation) {
+        return;
+    }
+
+    auto const& hdr = pEventRecord->EventHeader;
+    if (!IsProcessTrackedForFiltering(hdr.ProcessId)) {
+        return;
+    }
+
+    switch (hdr.EventDescriptor.Id) {
+    case Microsoft_Windows_Direct3D12::CreatePipelineStateObject_Start::Id:
+        mInterPresentActivity.OnActivityStart(
+            InterPresentActivity::Kind::D3D12PsoCompile,
+            hdr.ProcessId,
+            reinterpret_cast<const uint8_t*>(&hdr.ActivityId),
+            (uint64_t)hdr.TimeStamp.QuadPart);
+        break;
+    case Microsoft_Windows_Direct3D12::CreatePipelineStateObject_Stop::Id:
+        mInterPresentActivity.OnActivityStop(
+            InterPresentActivity::Kind::D3D12PsoCompile,
+            hdr.ProcessId,
+            reinterpret_cast<const uint8_t*>(&hdr.ActivityId),
+            (uint64_t)hdr.TimeStamp.QuadPart);
+        break;
+    default:
+        assert(!mFilteredEvents);
         break;
     }
 }
@@ -593,6 +650,10 @@ void PMTraceConsumer::HandleDxgkQueueComplete(uint64_t timestamp, uint64_t hCont
             // packets as not all present types create them.
             if (mTrackGPU) {
                 mGpuTrace.CompleteFrame(pEvent.get(), timestamp);
+            }
+            if (mTrackD3D12ShaderCompilation) {
+                // timestamp: present queue complete QPC (inter-present window close for this frame).
+                mInterPresentActivity.CompleteFrame(pEvent.get(), timestamp);
             }
 
             // We use present packet completion as the screen time for
@@ -995,6 +1056,10 @@ void PMTraceConsumer::HandleDXGKEvent(EVENT_RECORD* pEventRecord)
                 // For some present modes (e.g., Hardware_Legacy_Flip) this may be
                 // the first event telling us the present is ready.
                 mGpuTrace.CompleteFrame(present.get(), hdr.TimeStamp.QuadPart);
+                if (mTrackD3D12ShaderCompilation) {
+                    // hdr.TimeStamp: MMIO flip QPC (inter-present window close for this frame).
+                    mInterPresentActivity.CompleteFrame(present.get(), hdr.TimeStamp.QuadPart);
+                }
 
                 // Check and handle the post-flip status if available.
                 if (flipEntryStatusAfterFlipValid) {
@@ -1098,6 +1163,20 @@ void PMTraceConsumer::HandleDXGKEvent(EVENT_RECORD* pEventRecord)
                             if (pEvent->FinalState != PresentResult::Presented) {
                                 VerboseTraceBeforeModifyingPresent(pEvent.get());
                                 SetScreenTime(pEvent, hdr.TimeStamp.QuadPart);
+                            } else if (pEvent->DisplayedViaFlipFrameType && ShouldAppendApplicationAfterGeneratedDisplay(pEvent)) {
+                                // Special case for FlipFrameType_Info-based driver frame generation:
+                                // ApplyFlipFrameType() may have already appended a generated frame
+                                // which sets FinalState=Presented on the present.
+                                // In that case, this HSync/VSync MPO completion is the application frame
+                                // reaching the screen and should be appended as FrameType::NotSet.
+                                // We use NotSet because we don't want to accidentally treat this as a
+                                // driver-generated frame. This check is intentionally gated on 
+                                // DisplayedViaFlipFrameType to avoid incorrectly appending a frame
+                                // when PresentFrameType_Info is used instead (where the VSync event 
+                                // simply fills in the generated frame's display timestamp rather 
+                                // than signaling a separate application frame).
+                                VerboseTraceBeforeModifyingPresent(pEvent.get());
+                                pEvent->Displayed.emplace_back(FrameType::NotSet, hdr.TimeStamp.QuadPart);
                             }
 
                             // Complete the present.
@@ -1394,7 +1473,10 @@ void PMTraceConsumer::HandleDXGKEvent(EVENT_RECORD* pEventRecord)
                         // the present ids to it.
                         if (present != nullptr) {
                             VerboseTraceBeforeModifyingPresent(present.get());
-                            present->PresentIds.emplace(vidPnLayerId, PresentId[i]);
+                            auto inserted = present->PresentIds.emplace(vidPnLayerId, PresentId[i]);
+                            if (inserted.second) {
+                                present->ReportedPresentIds.push_back({ vidPnLayerId, PresentId[i] });
+                            }
                             mPresentByVidPnLayerId.emplace(vidPnLayerId, present);
                         }
 
@@ -1642,7 +1724,7 @@ void PMTraceConsumer::HandleWin32kEvent(EVENT_RECORD* pEventRecord)
                         // we get multiple back to back flips and token tracking thread 
                         // ends up marking the first frame in the burst as dropped. 
                         // To fix this issue, we mark the frame as discarded only if 
-                        // the frame already doesn’t have valid ScreenTime. 
+                        // the frame already doesn't have valid ScreenTime. 
                         if (!HasScreenTime(prevPresent)) {
                             prevPresent->FinalState = PresentResult::Discarded;
                         }
@@ -2235,6 +2317,7 @@ void PMTraceConsumer::CompletePresent(std::shared_ptr<PresentEvent> const& p)
             p->ProcessId,
             0,
             p->PresentStartTime,
+            p->PresentStartTime + p->TimeInPresent,
             [this](const AppTimingData& d) {
                 if (mUsingOutOfBoundPresentStart) {
                     return d.PclOutOfBandPresentStartTime;
@@ -2637,6 +2720,7 @@ void PMTraceConsumer::RuntimePresentStop(Runtime runtime, EVENT_HEADER const& hd
         return;
     }
     auto present = eventIter->second;
+    auto presentStopTime = static_cast<uint64_t>(hdr.TimeStamp.QuadPart);
 
     if (mTrackAppTiming) {
         if (IsApplicationPresent(present)) {
@@ -2645,7 +2729,9 @@ void PMTraceConsumer::RuntimePresentStop(Runtime runtime, EVENT_HEADER const& hd
                 present->ProcessId,
                 present->AppFrameId,
                 present->PresentStartTime,
-                [](const AppTimingData& d) { return d.AppPresentStartTime; });
+                presentStopTime,
+                [](const AppTimingData& d) { return d.AppPresentStartTime; },
+                false);
             if (appTimingData) {
                 if (present->ProcessId == appTimingData->ProcessId) {
                     if (present->AppFrameId == 0) {
@@ -2683,7 +2769,7 @@ void PMTraceConsumer::RuntimePresentStop(Runtime runtime, EVENT_HEADER const& hd
     // Set the runtime and Present_Stop time.
     VerboseTraceBeforeModifyingPresent(present.get());
     present->Runtime = runtime;
-    present->TimeInPresent = *(uint64_t*) &hdr.TimeStamp - present->PresentStartTime;
+    present->TimeInPresent = presentStopTime - present->PresentStartTime;
 
     // If this present completed early and was deferred until the Present_Stop, then no more
     // analysis is needed; we just clear the deferral.
@@ -3101,33 +3187,65 @@ void PMTraceConsumer::HandleIntelPresentMonEvent(EVENT_RECORD* pEventRecord)
             }
         }
         return;
-        case Intel_PresentMon::FlipFrameType_Info::Id:
+        case Intel_PresentMon::FlipFrameType_Info::Id: {
             if (mEnableFlipFrameTypeEvents) {
-                DebugAssert(pEventRecord->UserDataLength == sizeof(Intel_PresentMon::FlipFrameType_Info_Props));
+                uint32_t vidPnSourceId = 0;
+                uint32_t layerIndex = 0;
+                uint64_t presentId = 0;
+                uint64_t timestamp = 0;
+                FrameType frameType = FrameType::NotSet;
+                uint32_t processId = pEventRecord->EventHeader.ProcessId;
+                uint32_t threadId = pEventRecord->EventHeader.ThreadId;
 
-                auto props = (Intel_PresentMon::FlipFrameType_Info_Props*) pEventRecord->UserData;
-                auto timestamp = pEventRecord->EventHeader.TimeStamp.QuadPart;
-                auto frameType = ConvertPMPFrameTypeToFrameType(props->FrameType);
+                if (pEventRecord->EventHeader.EventDescriptor.Version == 0) {
+                    DebugAssert(pEventRecord->UserDataLength == sizeof(Intel_PresentMon::FlipFrameType_Info_Props));
+
+                    auto props = (Intel_PresentMon::FlipFrameType_Info_Props*)pEventRecord->UserData;
+                    vidPnSourceId = props->VidPnSourceId;
+                    layerIndex = props->LayerIndex;
+                    presentId = props->PresentId;
+                    timestamp = pEventRecord->EventHeader.TimeStamp.QuadPart;
+                    frameType = ConvertPMPFrameTypeToFrameType(props->FrameType);
+                }
+                else if (pEventRecord->EventHeader.EventDescriptor.Version == 1) {
+                    DebugAssert(pEventRecord->UserDataLength == sizeof(Intel_PresentMon::FlipFrameType_Info_2_Props));
+                    auto props = (Intel_PresentMon::FlipFrameType_Info_2_Props*)pEventRecord->UserData;
+                    vidPnSourceId = props->VidPnSourceId;
+                    layerIndex = props->LayerIndex;
+                    presentId = props->PresentId;
+                    frameType = ConvertPMPFrameTypeToFrameType(props->FrameType);
+                    timestamp = props->TimeStamp;
+                } else {
+                    // Unknown version
+                    return;
+                }
+
+                // For now, if timestamp is zero simply return
+                if (timestamp == 0) {
+                    return;
+                }
 
                 // Look up the present associated with this (VidPnSourceId, LayerIndex, PresentId).
                 //
                 // It is possible to see the FlipFrameType event before the MMIOFlipMultiPlaneOverlay3_Info
-                // event, in which case the lookup will fail.  In this case we deferr application of the
+                // event, in which case the lookup will fail.  In this case we defer application of the
                 // FlipFrameType until we see the MMIOFlipMultiPlaneOverlay3_Info event.
-                auto vidPnLayerId = GenerateVidPnLayerId(props->VidPnSourceId, props->LayerIndex);
+                auto vidPnLayerId = GenerateVidPnLayerId(vidPnSourceId, layerIndex);
                 auto ii = mPresentByVidPnLayerId.find(vidPnLayerId);
                 if (ii == mPresentByVidPnLayerId.end()) {
-                    DeferFlipFrameType(vidPnLayerId, props->PresentId, timestamp, frameType);
+                    DeferFlipFrameType(vidPnLayerId, presentId, timestamp, frameType, processId, threadId);
                     return;
                 }
 
                 auto present = ii->second;
                 auto jj = present->PresentIds.find(vidPnLayerId);
-                if (jj == present->PresentIds.end() || jj->second != props->PresentId) {
-                    DeferFlipFrameType(vidPnLayerId, props->PresentId, timestamp, frameType);
-                } else {
+                if (jj == present->PresentIds.end() || jj->second != presentId) {
+                    DeferFlipFrameType(vidPnLayerId, presentId, timestamp, frameType, processId, threadId);
+                }
+                else {
                     ApplyFlipFrameType(present, timestamp, frameType);
                 }
+            }
         }
         return;
         }
@@ -3407,15 +3525,47 @@ void PMTraceConsumer::DeferFlipFrameType(
     uint64_t vidPnLayerId,
     uint64_t presentId,
     uint64_t timestamp,
-    FrameType frameType)
+    FrameType frameType,
+    uint32_t processId,
+    uint32_t threadId)
 {
-    DebugAssert(mPendingFlipFrameTypeEvents.find(vidPnLayerId) == mPendingFlipFrameTypeEvents.end());
+    // If timestamp is 0 it means the frame was generated to be presented but did not actually get presented,
+    // so we should not defer the frame type.
+    if (timestamp == 0) {
+        return;
+    }
 
-    FlipFrameTypeEvent e;
-    e.PresentId = presentId;
-    e.Timestamp = timestamp;
-    e.FrameType = frameType;
-    mPendingFlipFrameTypeEvents.emplace(vidPnLayerId, e);
+    FlipFrameTypeEvent pendingEvent;
+    pendingEvent.PresentId = presentId;
+    pendingEvent.Timestamp = timestamp;
+    pendingEvent.FrameType = frameType;
+    pendingEvent.ProcessId = processId;
+    pendingEvent.ThreadId = threadId;
+
+    auto [pendingFlipFrameTypeEventIt, inserted] = mPendingFlipFrameTypeEvents.try_emplace(vidPnLayerId, pendingEvent);
+    if (!inserted) {
+        auto const& existingEvent = pendingFlipFrameTypeEventIt->second;
+        if (existingEvent == pendingEvent) {
+            pmlog_info(
+                "Received multiple FlipFrameType events for the same"
+                " VidPnSourceId: " + std::to_string(vidPnLayerId >> 32) +
+                " LayerIndex: " + std::to_string(vidPnLayerId & 0xFFFFFFFF) +
+                " with PresentId: " + std::to_string(presentId) +
+                " for ProcessId: " + std::to_string(processId) +
+                " with ThreadId: " + std::to_string(threadId) +
+                ". Ignoring this FlipFrameType event.");
+            return;
+        }
+
+        pmlog_info(
+            "Received a FlipFrameType event for VidPnSourceId: " + std::to_string(vidPnLayerId >> 32) +
+            " LayerIndex: " + std::to_string(vidPnLayerId & 0xFFFFFFFF) +
+            " with PresentId: " + std::to_string(presentId) +
+            " from ProcessId: " + std::to_string(processId) +
+            " with ThreadId: " + std::to_string(threadId) +
+            ". Overwriting the pending FlipFrameType event with the new one.");
+        pendingFlipFrameTypeEventIt->second = pendingEvent;
+    }
 }
 
 void PMTraceConsumer::ApplyFlipFrameType(
@@ -3428,11 +3578,13 @@ void PMTraceConsumer::ApplyFlipFrameType(
     for (auto p2 : present->DependentPresents) {
         if (p2->FinalState != PresentResult::Discarded) {
             VerboseTraceBeforeModifyingPresent(p2.get());
+            p2->DisplayedViaFlipFrameType = true;
             SetScreenTime(p2, timestamp, frameType);
         }
     }
 
     VerboseTraceBeforeModifyingPresent(present.get());
+    present->DisplayedViaFlipFrameType = true;
     SetScreenTime(present, timestamp, frameType);
 }
 
@@ -3644,6 +3796,7 @@ void PMTraceConsumer::ResetPresentTrackingData(bool shrink) {
     // Reset GPU/NV tracking helpers
     mGpuTrace.~GpuTrace();
     new (&mGpuTrace) GpuTrace(this);
+    mInterPresentActivity.Reset();
     mNvTraceConsumer.~NVTraceConsumer();
     new (&mNvTraceConsumer) NVTraceConsumer();
 }
@@ -3695,7 +3848,8 @@ PMTraceConsumer::EventProcessingScope::~EventProcessingScope()
 
 AppTimingData* PMTraceConsumer::ExtractAppTimingData(
     std::unordered_map<std::pair<uint32_t, uint32_t>, AppTimingData, PairHash<uint32_t, uint32_t>>& timingDataByFrameId,
-    uint32_t processId, uint32_t appFrameId, uint64_t presentStartTime, std::function<uint64_t(const AppTimingData&)> timingSelector) {
+    uint32_t processId, uint32_t appFrameId, uint64_t presentStartTime, uint64_t presentStopTime, std::function<uint64_t(const AppTimingData&)> timingSelector,
+    bool isPcLatency) {
     if (appFrameId != 0) {
         // If the incoming app frame id is already assigned then we receiving
         // the information from version 2 of the PresentFrameType event.
@@ -3707,24 +3861,50 @@ AppTimingData* PMTraceConsumer::ExtractAppTimingData(
             return &ii->second;
         }
     } else {
-        auto itToReturn = timingDataByFrameId.end();
-        uint32_t earlierFrameId = std::numeric_limits<uint32_t>::max();
-        uint64_t smallestPresentStartDelta = std::numeric_limits<uint64_t>::max();
-        // Search for the timing data with the closest PresentStartTime to the passed
-        // in PresentStartTime that has not been assigned. This is a hack and will not work for x-platform.
-        for (auto it = timingDataByFrameId.begin(); it != timingDataByFrameId.end(); ++it) {
-            if (it->first.second == processId) {
-                if (it->second.AssignedToPresent == false) {
-                    uint64_t timingValue = timingSelector(it->second);
-                    if (timingValue != 0 && timingValue < presentStartTime) {
-                        auto tempPresentStartDelta = presentStartTime - timingValue;
-                        if (tempPresentStartDelta < smallestPresentStartDelta) {
-                            smallestPresentStartDelta = tempPresentStartDelta;
-                            earlierFrameId = it->first.first;
-                            itToReturn = it;
-                        }
+        // Select the unassigned entry whose selected time is closest to (but earlier than)
+        // presentStartTime. This is a hack and will not work for x-platform.
+        auto findClosestBeforePresentStart = [&]() {
+            auto best = timingDataByFrameId.end();
+            uint64_t smallestDelta = std::numeric_limits<uint64_t>::max();
+            for (auto it = timingDataByFrameId.begin(); it != timingDataByFrameId.end(); ++it) {
+                if (it->first.second != processId || it->second.AssignedToPresent) {
+                    continue;
+                }
+                uint64_t timingValue = timingSelector(it->second);
+                if (timingValue != 0 && timingValue < presentStartTime) {
+                    uint64_t delta = presentStartTime - timingValue;
+                    if (delta < smallestDelta) {
+                        smallestDelta = delta;
+                        best = it;
                     }
                 }
+            }
+            return best;
+        };
+        auto itToReturn = timingDataByFrameId.end();
+        if (isPcLatency) {
+            // For PC latency we match app timing data using findClosestBeforePresentStart.
+            itToReturn = findClosestBeforePresentStart();
+        } else {
+            // For non-PC latency metrics we match unassigned timing data whose selected time falls
+            // between present start and stop. If more than one qualifies, use the earliest.
+            uint64_t earliestTimingValueInWindow = std::numeric_limits<uint64_t>::max();
+            for (auto it = timingDataByFrameId.begin(); it != timingDataByFrameId.end(); ++it) {
+                if (it->first.second != processId || it->second.AssignedToPresent) {
+                    continue;
+                }
+                uint64_t timingValue = timingSelector(it->second);
+                if (timingValue != 0
+                    && presentStartTime <= timingValue
+                    && timingValue <= presentStopTime
+                    && timingValue < earliestTimingValueInWindow) {
+                    earliestTimingValueInWindow = timingValue;
+                    itToReturn = it;
+                }
+            }
+            if (itToReturn == timingDataByFrameId.end()) {
+                // No timing in the present window; fall back to closest-before-presentStart.
+                itToReturn = findClosestBeforePresentStart();
             }
         }
 

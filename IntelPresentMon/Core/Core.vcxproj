@@ -52,17 +52,16 @@
     <ClInclude Include="source\gfx\prim\RectPrimitive.h" />
     <ClInclude Include="source\gfx\prim\TextPrimitive.h" />
     <ClInclude Include="source\gfx\prim\TextStylePrimitive.h" />
-    <ClInclude Include="source\iact\ActionClient.h" />
     <ClInclude Include="source\infra\Logging.h" />
     <ClInclude Include="source\infra\LogSetup.h" />
     <ClInclude Include="source\infra\util\CooldownTimer.h" />
     <ClInclude Include="source\infra\util\FolderResolver.h" />
     <ClInclude Include="source\kernel\DataFetchPack.h" />
-    <ClInclude Include="source\kernel\InjectorComplex.h" />
     <ClInclude Include="source\kernel\MetricPackMapper.h" />
     <ClInclude Include="source\pmon\DynamicQuery.h" />
     <ClInclude Include="source\pmon\metric\DynamicPollingFetcher.h" />
     <ClInclude Include="source\pmon\MetricFetcherFactory.h" />
+    <ClInclude Include="source\pmon\QualifiedMetricAvailability.h" />
     <ClInclude Include="source\pmon\RawFrameDataMetricList.h" />
     <ClInclude Include="source\pmon\StatisticsTracker.h" />
     <ClInclude Include="source\kernel\KernelHandler.h" />
@@ -71,6 +70,7 @@
     <ClInclude Include="source\kernel\WindowActivateHandler.h" />
     <ClInclude Include="source\kernel\WindowSpawnHandler.h" />
     <ClInclude Include="source\pmon\metric\MetricFetcher.h" />
+    <ClInclude Include="source\pmon\FrameMetricCapabilitiesCsv.h" />
     <ClInclude Include="source\pmon\RawFrameDataWriter.h" />
     <ClInclude Include="source\meta\TypeFromMember.h" />
     <ClInclude Include="source\pmon\PresentMon.h" />
@@ -121,11 +121,9 @@
     <ClCompile Include="source\gfx\prim\RetainedPrimitive.cpp" />
     <ClCompile Include="source\gfx\prim\TextPrimitive.cpp" />
     <ClCompile Include="source\gfx\prim\TextStylePrimitive.cpp" />
-    <ClCompile Include="source\iact\ActionClient.cpp" />
     <ClCompile Include="source\infra\LogSetup.cpp" />
     <ClCompile Include="source\infra\util\CooldownTimer.cpp" />
     <ClCompile Include="source\infra\util\FolderResolver.cpp" />
-    <ClCompile Include="source\kernel\InjectorComplex.cpp" />
     <ClCompile Include="source\pmon\DynamicQuery.cpp" />
     <ClCompile Include="source\pmon\metric\DynamicPollingFetcher.cpp" />
     <ClCompile Include="source\pmon\StatisticsTracker.cpp" />
@@ -134,6 +132,7 @@
     <ClCompile Include="source\kernel\WindowSpawnHandler.cpp" />
     <ClCompile Include="source\pmon\metric\MetricFetcher.cpp" />
     <ClCompile Include="source\pmon\PresentMon.cpp" />
+    <ClCompile Include="source\pmon\FrameMetricCapabilitiesCsv.cpp" />
     <ClCompile Include="source\pmon\RawFrameDataWriter.cpp" />
     <ClCompile Include="source\pmon\Timekeeper.cpp" />
     <ClCompile Include="source\kernel\Kernel.cpp" />

@@ -29,9 +29,15 @@
         
         <MediaTemplate EmbedCab="yes" />
 
+        <?if $(var.PmonUseExplicitConsolePath) = "true" ?>
+        <?define console_app_path = "$(var.PmonConsoleTargetPath)" ?>
+        <?define console_app_filename = "$(var.PmonConsoleTargetFileName)" ?>
+        <?define has_console_app = $(pm.CheckFileExists($(var.console_app_path))) ?>
+        <?else?>
         <?define console_app_path = $(pm.GetConsoleAppPath($(var.SolutionDir), $(var.ConsoleAppVersion))) ?>
         <?define console_app_filename = $(pm.GetConsoleAppFileName($(var.ConsoleAppVersion))) ?>
         <?define has_console_app = $(pm.CheckFileExists($(var.console_app_path))) ?>
+        <?endif?>
 		<?define WebRoot = "$(var.PresentMon.TargetDir)ipm-ui-vue" ?>
 
         <Feature
@@ -375,46 +381,6 @@
                     KeyPath="yes">
 				</File>
 			</Component>
-			<Component
-                Id="pm_app_flash_injector_32"
-                Guid="53B0360B-8EC3-4E52-BB97-E30A8D16C813">
-				<File
-                    Id="pm_app_flash_injector_32"
-                    Name="FlashInjector-Win32.exe"
-                    Source="$(var.PresentMon.TargetDir)FlashInjector-Win32.exe"
-                    KeyPath="yes">
-				</File>
-			</Component>
-			<Component
-                Id="pm_app_flash_injector_64"
-                Guid="1397EEFE-95DF-4761-9597-5966B2416C25">
-				<File
-                    Id="pm_app_flash_injector_64"
-                    Name="FlashInjector-x64.exe"
-                    Source="$(var.PresentMon.TargetDir)FlashInjector-x64.exe"
-                    KeyPath="yes">
-				</File>
-			</Component>
-			<Component
-                Id="pm_app_flash_injection_library_32_dll"
-                Guid="5DCE775A-1849-4540-828E-CDE676995FCC">
-				<File
-                    Id="pm_app_flash_injection_library_32_dll"
-                    Name="FlashInjectorLibrary-Win32.dll"
-                    Source="$(var.PresentMon.TargetDir)FlashInjectorLibrary-Win32.dll"
-                    KeyPath="yes">
-				</File>
-			</Component>
-			<Component
-                Id="pm_app_flash_injection_library_64_dll"
-                Guid="E149257A-E935-453E-B6C1-1764C3CE7DDE">
-				<File
-                    Id="pm_app_flash_injection_library_64_dll"
-                    Name="FlashInjectorLibrary-x64.dll"
-                    Source="$(var.PresentMon.TargetDir)FlashInjectorLibrary-x64.dll"
-                    KeyPath="yes">
-				</File>
-			</Component>
         </ComponentGroup>
         <ComponentGroup
             Id="pm_app_pathed"
@@ -509,6 +475,16 @@
                     KeyPath="yes">
                 </File>
             </Component>
+            <Component
+                Id="pm_app_preset_3"
+                Guid="A1C2E3F4-5B6D-4789-A012-3456789ABCDE">
+                <File
+                    Id="pm_app_preset_3"
+                    Name="preset-3.json"
+                    Source="$(var.PresentMon.TargetDir)Presets\preset-3.json"
+                    KeyPath="yes">
+                </File>
+            </Component>
         </ComponentGroup>
         <ComponentGroup
             Id="pm_app_web"
@@ -591,6 +567,46 @@
                     KeyPath="yes">
                 </File>
             </Component>
+            <Component
+                Id="pm_app_web_fonts_roboto_greek_400_normal_woff2"
+                Guid="65946F92-195F-4029-BFFE-60675358373F">
+                <File
+                    Id="pm_app_web_fonts_roboto_greek_400_normal_woff2"
+                    Name="roboto-greek-400-normal.woff2"
+                    Source="$(var.WebRoot)\fonts\roboto-greek-400-normal.woff2"
+                    KeyPath="yes">
+                </File>
+            </Component>
+            <Component
+                Id="pm_app_web_fonts_roboto_math_400_normal_woff2"
+                Guid="67946F92-197F-4029-BFFE-60675358373F">
+                <File
+                    Id="pm_app_web_fonts_roboto_math_400_normal_woff2"
+                    Name="roboto-math-400-normal.woff2"
+                    Source="$(var.WebRoot)\fonts\roboto-math-400-normal.woff2"
+                    KeyPath="yes">
+                </File>
+            </Component>
+            <Component
+                Id="pm_app_web_fonts_roboto_symbols_400_normal_woff2"
+                Guid="69946F92-199F-4029-BFFE-60675358373F">
+                <File
+                    Id="pm_app_web_fonts_roboto_symbols_400_normal_woff2"
+                    Name="roboto-symbols-400-normal.woff2"
+                    Source="$(var.WebRoot)\fonts\roboto-symbols-400-normal.woff2"
+                    KeyPath="yes">
+                </File>
+            </Component>
+            <Component
+                Id="pm_app_web_fonts_roboto_vietnamese_400_normal_woff2"
+                Guid="6B946F92-19BF-4029-BFFE-60675358373F">
+                <File
+                    Id="pm_app_web_fonts_roboto_vietnamese_400_normal_woff2"
+                    Name="roboto-vietnamese-400-normal.woff2"
+                    Source="$(var.WebRoot)\fonts\roboto-vietnamese-400-normal.woff2"
+                    KeyPath="yes">
+                </File>
+            </Component>
         </ComponentGroup>
         <ComponentGroup
             Id="pm_app_web_js"
@@ -628,32 +644,59 @@
 			<Component
                 Id="loader_import_lib"
                 Guid="5746C4B9-7D3D-47AE-AEC5-9EB8CEFDAAEB">
+				<?if $(var.PmonUseExplicitConsolePath) = "true" ?>
+				<File
+                    Id="loader_import_lib"
+                    Name="PresentMonAPI2Loader.lib"
+                    Source="$(var.PmonPresentMonAPI2LoaderLibSource)"
+                    KeyPath="yes">
+				</File>
+				<?else?>
 				<File
                     Id="loader_import_lib"
                     Name="PresentMonAPI2Loader.lib"
                     Source="$(var.PresentMonAPI2Loader.TargetDir)"
                     KeyPath="yes">
 				</File>
+				<?endif?>
 			</Component>
 			<Component
                 Id="loader_dll"
                 Guid="FB49F469-944D-4772-AA68-759BC3264430">
+				<?if $(var.PmonUseExplicitConsolePath) = "true" ?>
+				<File
+                    Id="loader_dll"
+                    Name="$(var.PresentMonAPI2Loader.TargetFileName)"
+                    Source="$(var.PresentMonAPI2Loader.TargetPath)"
+                    KeyPath="yes">
+				</File>
+				<?else?>
 				<File
                     Id="loader_dll"
                     Name="$(var.PresentMonAPI2Loader.TargetFileName)"
                     Source="$(var.PresentMonAPI2Loader.TargetDir)"
                     KeyPath="yes">
 				</File>
+				<?endif?>
 			</Component>
 			<Component
                 Id="api_header"
                 Guid="482AD952-40FB-4278-BF41-EF9F61F709BC">
+				<?if $(var.PmonUseExplicitConsolePath) = "true" ?>
+				<File
+                    Id="api_header"
+                    Name="PresentMonAPI.h"
+                    Source="$(var.PmonPresentMonAPI2HeaderSource)"
+                    KeyPath="yes">
+				</File>
+				<?else?>
 				<File
                     Id="api_header"
                     Name="PresentMonAPI.h"
                     Source="$(var.PresentMonAPI2.ProjectDir)"
                     KeyPath="yes">
 				</File>
+				<?endif?>
 			</Component>
 		</ComponentGroup>
     </Fragment>

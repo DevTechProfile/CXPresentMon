@@ -28,13 +28,13 @@ namespace pmon::mid
 		Middleware& operator=(const Middleware&) = delete;
 		Middleware(Middleware&&);
 		Middleware& operator=(Middleware&&);
-		~Middleware();
+		~Middleware() noexcept;
 		const PM_INTROSPECTION_ROOT* GetIntrospectionData();
 		void FreeIntrospectionData(const PM_INTROSPECTION_ROOT* pRoot);
 		void StartTracking(uint32_t processId);
 		void StartPlaybackTracking(uint32_t processId, bool isBackpressured);
 		void StopTracking(uint32_t processId);
-		void SetTelemetryPollingPeriod(uint32_t deviceId, uint32_t timeMs);
+		void SetTelemetryPollingPeriod(uint32_t deviceId, std::optional<uint32_t> periodMs);
 		void SetEtwFlushPeriod(std::optional<uint32_t> periodMs);
 		void FlushFrames(uint32_t processId);
 		PM_DYNAMIC_QUERY* RegisterDynamicQuery(std::span<PM_QUERY_ELEMENT> queryElements, double windowSizeMs, double metricOffsetMs);

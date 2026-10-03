@@ -137,7 +137,27 @@ namespace pmon::mid
 
     Middleware& Middleware::operator=(Middleware&&) = default;
 
-    Middleware::~Middleware() = default;
+    Middleware::~Middleware() noexcept
+    {
+        try {
+            std::vector<uint32_t> trackedPids;
+            trackedPids.reserve(frameMetricsSources_.size());
+            for (const auto& entry : frameMetricsSources_) {
+                trackedPids.push_back(entry.first);
+            }
+            for (uint32_t pid : trackedPids) {
+                try {
+                    StopTracking(pid);
+                }
+                catch (...) {
+                    pmlog_warn(std::format("StopTracking failed during middleware teardown for pid [{}]", pid));
+                }
+            }
+        }
+        catch (...) {
+            pmlog_error(util::ReportException("Middleware teardown"));
+        }
+    }
     
     const PM_INTROSPECTION_ROOT* Middleware::GetIntrospectionData()
     {
@@ -214,10 +234,10 @@ namespace pmon::mid
         return *pIntroRoot_;
     }
 
-    void Middleware::SetTelemetryPollingPeriod(uint32_t deviceId, uint32_t timeMs)
+    void Middleware::SetTelemetryPollingPeriod(uint32_t deviceId, std::optional<uint32_t> periodMs)
     {
         // note: deviceId is being ignored for the time being, but might be used in the future
-        pActionClient_->DispatchSync(SetTelemetryPeriod::Params{ timeMs });
+        pActionClient_->DispatchSync(SetTelemetryPeriod::Params{ .telemetrySamplePeriodMs = periodMs });
     }
 
     void Middleware::SetEtwFlushPeriod(std::optional<uint32_t> periodMs)

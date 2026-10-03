@@ -138,6 +138,9 @@ extern "C" {
 		PM_METRIC_BETWEEN_APP_START,
 		PM_METRIC_PRESENTED_FRAME_TIME,
 		PM_METRIC_FLIP_DELAY,
+		PM_METRIC_PSO_COMPILE_COUNT,
+		PM_METRIC_PSO_COMPILE_TIME,
+		PM_METRIC_PSO_COMPILE_BUSY_PERCENT,
 		PM_METRIC_PROCESS_ID,
 		PM_METRIC_SESSION_START_QPC,
 		PM_METRIC_CPU_CORE_TEMPERATURE,
@@ -267,6 +270,9 @@ extern "C" {
 	{
 		PM_METRIC_AVAILABILITY_AVAILABLE,
 		PM_METRIC_AVAILABILITY_UNAVAILABLE,
+		PM_METRIC_AVAILABILITY_NOT_EXPORTED_BY_SOURCE,
+		PM_METRIC_AVAILABILITY_NOT_SUPPORTED_BY_DEVICE,
+		PM_METRIC_AVAILABILITY_NOT_IMPLEMENTED_BY_PRESENTMON,
 	};
 
 	// this is required but has no external use
@@ -422,12 +428,14 @@ extern "C" {
 	// free the introspection tree structure
 	PRESENTMON_API2_EXPORT PM_STATUS pmFreeIntrospectionRoot(const PM_INTROSPECTION_ROOT* pRoot);
 	// sets the rate at which hardware telemetry (including CPU) is polled
+	// a value of zero indicates to use current service setting (default or value requested by other client)
 	PRESENTMON_API2_EXPORT PM_STATUS pmSetTelemetryPollingPeriod(PM_SESSION_HANDLE handle, uint32_t reserved, uint32_t timeMs);
-#define PM_TELEMETRY_PERIOD_MIN 4
+#define PM_TELEMETRY_PERIOD_MIN 50
 #define PM_TELEMETRY_PERIOD_MAX 5000
 	// sets the rate at which ETW event buffers are flushed, affecting the delay of frame data reported by PresentMon
 	// a value of zero indicates to use current service setting (default or value requested by other client)
 	PRESENTMON_API2_EXPORT PM_STATUS pmSetEtwFlushPeriod(PM_SESSION_HANDLE handle, uint32_t periodMs);
+#define PM_ETW_FLUSH_PERIOD_MIN 8
 #define PM_ETW_FLUSH_PERIOD_MAX 1000
 	// flush any buffered frame event data for the specified process on this session
 	PRESENTMON_API2_EXPORT PM_STATUS pmFlushFrames(PM_SESSION_HANDLE handle, uint32_t processId);

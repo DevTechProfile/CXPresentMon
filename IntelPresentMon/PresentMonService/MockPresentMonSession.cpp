@@ -4,6 +4,7 @@
 #include "CliOptions.h"
 #include "..\CommonUtilities\str\String.h"
 #include "Logging.h"
+#include "../CommonUtilities/log/IdentificationTable.h"
 
 static const std::wstring kMockEtwSessionName = L"MockETWSession";
 
@@ -82,7 +83,7 @@ PM_STATUS MockPresentMonSession::UpdateTracking(const std::unordered_set<uint32_
         if (evtStreamingStarted_) {
             evtStreamingStarted_.Reset();
         }
-        StopTraceSession();
+        RequestStopTraceSession();
     }
 
     return PM_STATUS::PM_STATUS_SUCCESS;
@@ -90,12 +91,20 @@ PM_STATUS MockPresentMonSession::UpdateTracking(const std::unordered_set<uint32_
 
 bool MockPresentMonSession::CheckTraceSessions(bool forceTerminate) {
     if (session_active_.load(std::memory_order_acquire) && stop_playback_requested_ == true) {
-        StopTraceSession();
+        RequestStopTraceSession();
+    }
+
+    if (stop_trace_join_pending_.load(std::memory_order_acquire)) {
+        FinalizeStopTraceSession();
+        if (forceTerminate) {
+            ClearTrackedProcesses();
+        }
         return true;
     }
 
     if (forceTerminate) {
-        StopTraceSession();
+        RequestStopTraceSession();
+        FinalizeStopTraceSession();
         ClearTrackedProcesses();
         return true;
     }
@@ -151,6 +160,7 @@ PM_STATUS MockPresentMonSession::StartTraceSession(uint32_t processId, const std
     pm_consumer_->mTrackDisplay = true;
     pm_consumer_->mTrackGPU = true;
     pm_consumer_->mTrackGPUVideo = false;
+    pm_consumer_->mTrackD3D12ShaderCompilation = true;
     pm_consumer_->mTrackInput = true;
     pm_consumer_->mTrackFrameType = true;
     pm_consumer_->mTrackAppTiming = true;
@@ -203,31 +213,39 @@ PM_STATUS MockPresentMonSession::StartTraceSession(uint32_t processId, const std
     return PM_STATUS::PM_STATUS_SUCCESS;
 }
 
-void MockPresentMonSession::StopTraceSession() {
-    // PHASE 1: Signal shutdown and wait for threads to observe it
-    // also enforce only_once semantics with atomic flag
-    if (session_active_.exchange(false, std::memory_order_acq_rel)) {
-
-        // Stop the trace session.
-        trace_session_.Stop();
-
-        // Wait for the consumer and output threads to end (which are using the
-        // consumers).
-        WaitForConsumerThreadToExit();
-        StopOutputThread();
-
-        // PHASE 2: Safe cleanup after threads have finished
-        std::lock_guard<std::mutex> lock(session_mutex_);
-
-        if (evtStreamingStarted_) {
-            evtStreamingStarted_.Reset();
-        }
-
-        if (pm_consumer_) {
-            pm_consumer_.reset();
-        }
-        started_processes_.clear();
+void MockPresentMonSession::RequestStopTraceSession() {
+    if (!session_active_.exchange(false, std::memory_order_acq_rel)) {
+        return;
     }
+
+    quit_output_thread_.store(true, std::memory_order_release);
+
+    if (pBroadcaster) {
+        pBroadcaster->ReleaseAllBackpressure();
+    }
+
+    trace_session_.Stop();
+    stop_trace_join_pending_.store(true, std::memory_order_release);
+}
+
+void MockPresentMonSession::FinalizeStopTraceSession() {
+    if (!stop_trace_join_pending_.exchange(false, std::memory_order_acq_rel)) {
+        return;
+    }
+
+    WaitForConsumerThreadToExit();
+    StopOutputThread();
+
+    std::lock_guard<std::mutex> lock(session_mutex_);
+
+    if (evtStreamingStarted_) {
+        evtStreamingStarted_.Reset();
+    }
+
+    if (pm_consumer_) {
+        pm_consumer_.reset();
+    }
+    started_processes_.clear();
 }
 
 void MockPresentMonSession::StartConsumerThread(TRACEHANDLE traceHandle) {
@@ -380,6 +398,7 @@ void MockPresentMonSession::ProcessEvents(
 }
 
 void MockPresentMonSession::Consume(TRACEHANDLE traceHandle) {
+    util::log::IdentificationTable::AddThisThread("etw-consume");
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
 
     // You must call OpenTrace() prior to calling this function
@@ -405,6 +424,7 @@ void MockPresentMonSession::Consume(TRACEHANDLE traceHandle) {
 }
 
 void MockPresentMonSession::Output() {
+    util::log::IdentificationTable::AddThisThread("frame-out");
     // Structures to track processes and statistics from recorded events.
     std::vector<ProcessEvent> processEvents;
     std::vector<std::shared_ptr<PresentEvent>> presentEvents;

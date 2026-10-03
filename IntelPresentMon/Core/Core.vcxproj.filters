@@ -57,6 +57,7 @@
     <ClInclude Include="source\pmon\Timekeeper.h" />
     <ClInclude Include="source\pmon\PresentMon.h" />
     <ClInclude Include="source\meta\TypeFromMember.h" />
+    <ClInclude Include="source\pmon\FrameMetricCapabilitiesCsv.h" />
     <ClInclude Include="source\pmon\RawFrameDataWriter.h" />
     <ClInclude Include="source\pmon\metric\MetricFetcher.h" />
     <ClInclude Include="source\kernel\TargetLostException.h" />
@@ -83,8 +84,6 @@
     <ClInclude Include="source\infra\LogSetup.h" />
     <ClInclude Include="source\infra\Logging.h" />
     <ClInclude Include="source\win\HotkeyListener.h" />
-    <ClInclude Include="source\iact\ActionClient.h" />
-    <ClInclude Include="source\kernel\InjectorComplex.h" />
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="source\win\MessageMap.cpp" />
@@ -124,6 +123,7 @@
     <ClCompile Include="source\gfx\layout\style\RawAttributeHelpers.cpp" />
     <ClCompile Include="source\pmon\Timekeeper.cpp" />
     <ClCompile Include="source\pmon\PresentMon.cpp" />
+    <ClCompile Include="source\pmon\FrameMetricCapabilitiesCsv.cpp" />
     <ClCompile Include="source\pmon\RawFrameDataWriter.cpp" />
     <ClCompile Include="source\win\Key.cpp" />
     <ClCompile Include="source\win\ModSet.cpp" />
@@ -140,8 +140,6 @@
     <ClCompile Include="source\pmon\metric\DynamicPollingFetcher.cpp" />
     <ClCompile Include="source\infra\LogSetup.cpp" />
     <ClCompile Include="source\win\HotkeyListener.cpp" />
-    <ClCompile Include="source\iact\ActionClient.cpp" />
-    <ClCompile Include="source\kernel\InjectorComplex.cpp" />
   </ItemGroup>
   <ItemGroup>
     <None Include="cpp.hint" />

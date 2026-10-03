@@ -1,4 +1,4 @@
-// Copyright (C) 2017-2024 Intel Corporation
+﻿// Copyright (C) 2017-2026 Intel Corporation
 // Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved
 // SPDX-License-Identifier: MIT
 #pragma once
@@ -7,6 +7,7 @@
 #define NOMINMAX
 #endif
 
+#include <array>
 #include <deque>
 #include <atomic>
 #include <map>
@@ -26,6 +27,7 @@
 
 #include "Debug.hpp"
 #include "GpuTrace.hpp"
+#include "InterPresentActivity.hpp"
 #include "TraceConsumer.hpp"
 #include "NvidiaTraceConsumer.hpp"
 #include "PresentEventEnums.hpp"
@@ -117,9 +119,20 @@ struct PresentFrameTypeEvent {
 };
 
 struct FlipFrameTypeEvent {
-    uint64_t PresentId;
-    uint64_t Timestamp;
-    FrameType FrameType;
+    uint64_t PresentId = 0;
+    uint64_t Timestamp = 0;
+    FrameType FrameType = FrameType::NotSet;
+    uint32_t ProcessId = 0;
+    uint32_t ThreadId = 0;
+
+    bool operator==(FlipFrameTypeEvent const& other) const
+    {
+        return PresentId == other.PresentId &&
+               Timestamp == other.Timestamp &&
+               FrameType == other.FrameType &&
+               ProcessId == other.ProcessId &&
+               ThreadId == other.ThreadId;
+    }
 };
 
 // Structure used to track application provided timing information 
@@ -220,6 +233,8 @@ struct PresentEvent {
     uint32_t QueueSubmitSequence;         // mPresentBySubmitSequence
     uint32_t RingIndex;                   // mTrackedPresents and mCompletedPresents
     std::unordered_map<uint64_t, uint64_t> PresentIds; // mPresentByVidPnLayerId
+    // first u64: vidPnLayerId (high 32 vidPnSourceId, low 32 layerIndex); second u64: PresentId
+    std::vector<std::pair<uint64_t, uint64_t>> ReportedPresentIds;
     // Note: the following index tracking structures as well but are defined elsewhere:
     //       ProcessId                 -> mOrderedPresentsByProcessId
     //       ThreadId, DriverThreadId  -> mPresentByThreadId
@@ -268,6 +283,12 @@ struct PresentEvent {
     bool WaitingForFlipFrameType;
     bool DoneWaitingForFlipFrameType;
 
+    // If DisplayedViaFlipFrameType, this present had a generated frame display set via
+    // ApplyFlipFrameType() (i.e., from a FlipFrameType_Info event). This distinguishes it from
+    // presents annotated via PresentFrameType_Info, where the VSync event should NOT append an
+    // additional application frame.
+    bool DisplayedViaFlipFrameType;
+
     // If WaitingForFrameId, the present is waiting for another present with the same FrameId (or,
     // until a PresentFrameType_Info event with a different FrameId).
     bool WaitingForFrameId;
@@ -275,6 +296,20 @@ struct PresentEvent {
     // Data from NV DisplayDriver event
     uint64_t FlipDelay = 0;
     uint32_t FlipToken = 0;
+
+    std::array<InterPresentActivity::FrameStats, (size_t)InterPresentActivity::Kind::Count> InterPresentStats{};
+    // QPC span (lastInterPresentCloseQpc, interPresentCloseQpc] used as busy-% denominator for stats above.
+    uint64_t InterPresentFramePeriodQpc = 0;
+    bool InterPresentFrameCompleted = false;
+
+    InterPresentActivity::FrameStats& InterPresentPsoStats()
+    {
+        return InterPresentStats[(size_t)InterPresentActivity::Kind::D3D12PsoCompile];
+    }
+    const InterPresentActivity::FrameStats& InterPresentPsoStats() const
+    {
+        return InterPresentStats[(size_t)InterPresentActivity::Kind::D3D12PsoCompile];
+    }
 
     PresentEvent();
     PresentEvent(uint32_t fid);
@@ -304,6 +339,7 @@ struct PMTraceConsumer
     bool mTrackHybridPresent = false;  // ... hybrid presents.
     bool mTrackPcLatency = false;      // ... Nvidia PC Latency stats.
     bool mTrackProcessState = false;   // ... Initial process state dump
+    bool mTrackD3D12ShaderCompilation = false; // ... D3D12 CreatePipelineStateObject ETW timing.
 
     // When PresentEvents are missing data that may still arrive later, they get put into a deferred
     // state until the data arrives.  This time limit specifies how long a PresentEvent can be
@@ -541,6 +577,7 @@ struct PMTraceConsumer
 
     // mGpuTrace tracks work executed on the GPU.
     GpuTrace mGpuTrace;
+    InterPresentActivity mInterPresentActivity;
 
     // PresentFrameTypeEvents are stored into mPendingPresentFrameTypeEvents and then looked-up and
     // attached to the PresentEvent in Present_Start.
@@ -595,6 +632,7 @@ struct PMTraceConsumer
     void HandleProcessEvent(EVENT_RECORD* pEventRecord);
     void HandleDXGIEvent(EVENT_RECORD* pEventRecord);
     void HandleD3D9Event(EVENT_RECORD* pEventRecord);
+    void HandleD3D12Event(EVENT_RECORD* pEventRecord);
     void HandleDXGKEvent(EVENT_RECORD* pEventRecord);
     void HandleWin32kEvent(EVENT_RECORD* pEventRecord);
     void HandleDWMEvent(EVENT_RECORD* pEventRecord);
@@ -628,7 +666,7 @@ struct PMTraceConsumer
 
     void UpdateReadyCount(bool useLock);
 
-    void DeferFlipFrameType(uint64_t vidPnLayerId, uint64_t presentId, uint64_t timestamp, FrameType frameType);
+    void DeferFlipFrameType(uint64_t vidPnLayerId, uint64_t presentId, uint64_t timestamp, FrameType frameType, uint32_t processId, uint32_t threadId);
     void ApplyFlipFrameType(std::shared_ptr<PresentEvent> const& present, uint64_t timestamp, FrameType frameType);
     void ApplyPresentFrameType(std::shared_ptr<PresentEvent> const& present);
     void SetAppTimingData(const EVENT_RECORD* pEventRecord);
@@ -637,7 +675,9 @@ struct PMTraceConsumer
     
     // -------------------------------------------------------------------------------------------
     // Function for managing app provided events
-    AppTimingData* ExtractAppTimingData(std::unordered_map<std::pair<uint32_t, uint32_t>, AppTimingData, PairHash<uint32_t, uint32_t>>& timingDataByFrameId, uint32_t processId, uint32_t appFrameId, uint64_t presentStartTime, std::function<uint64_t(const AppTimingData&)> timingSelector);
+    AppTimingData* ExtractAppTimingData(std::unordered_map<std::pair<uint32_t, uint32_t>, AppTimingData, PairHash<uint32_t, uint32_t>>& timingDataByFrameId, 
+        uint32_t processId, uint32_t appFrameId, uint64_t presentStartTime, uint64_t presentStopTime, 
+        std::function<uint64_t(const AppTimingData&)> timingSelector, bool isPcLatency = true);
     bool IsApplicationPresent(std::shared_ptr<PresentEvent> const& present);
     void SetAppTimingDataAsComplete(uint32_t processId, uint32_t appFrameId);
 

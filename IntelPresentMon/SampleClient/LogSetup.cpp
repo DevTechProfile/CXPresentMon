@@ -10,6 +10,9 @@
 #include "../CommonUtilities/win/HrErrorCodeProvider.h"
 #include "../CommonUtilities/str/String.h"
 #include "../PresentMonAPIWrapperCommon/PmErrorCodeProvider.h"
+#include "../CommonUtilities/log/HostLogEntryForward.h"
+#include "../CommonUtilities/log/HostIdentificationForward.h"
+#include "../CommonUtilities/test/CrtDiagnosticsRedirect.h"
 #include "../PresentMonAPI2/Internal.h"
 #include "CliOptions.h"
 #include "LogSetup.h"
@@ -64,7 +67,10 @@ namespace p2sam
 			// get the channel to work on it
 			auto pChan = GetDefaultChannel();
 			// connect dll channel and id table to exe, get access to global settings in dll
-			const auto getters = pmLinkLogging_(pChan, IdentificationTable::MakeForwardingCallbacks());
+			const auto getters = pmLinkLoggingPtrs_(pChan.get(), IdentificationTable::GetPtr(),
+				&ForwardLogEntryToHostChannel,
+				&ForwardAddThreadToHostIdTable,
+				&ForwardAddProcessToHostIdTable);
 			// shortcut for command line
 			const auto& opt = clio::Options::Get();
 			// configure logging based on command line
@@ -80,37 +86,50 @@ namespace p2sam
 			}
 			if (opt.logLevel) {
 				GlobalPolicy::Get().SetLogLevel(*opt.logLevel);
-				getters.getGlobalPolicy().SetLogLevel(*opt.logLevel);
+				if (getters) {
+					getters.getGlobalPolicy().SetLogLevel(*opt.logLevel);
+				}
 			}
 			if (opt.logVerboseModules) {
 				for (auto mod : *opt.logVerboseModules) {
 					GlobalPolicy::Get().ActivateVerboseModule(mod);
-					getters.getGlobalPolicy().ActivateVerboseModule(mod);
+					if (getters) {
+						getters.getGlobalPolicy().ActivateVerboseModule(mod);
+					}
 				}
 			}
 			if (opt.logTraceLevel) {
 				GlobalPolicy::Get().SetTraceLevel(*opt.logTraceLevel);
-				getters.getGlobalPolicy().SetTraceLevel(*opt.logTraceLevel);
+				if (getters) {
+					getters.getGlobalPolicy().SetTraceLevel(*opt.logTraceLevel);
+				}
 			}
 			if (opt.logTraceExceptions) {
 				GlobalPolicy::Get().SetExceptionTrace(*opt.logTraceExceptions);
 				GlobalPolicy::Get().SetSehTracing(*opt.logTraceExceptions);
-				getters.getGlobalPolicy().SetExceptionTrace(*opt.logTraceExceptions);
-				getters.getGlobalPolicy().SetSehTracing(*opt.logTraceExceptions);
+				if (getters) {
+					getters.getGlobalPolicy().SetExceptionTrace(*opt.logTraceExceptions);
+					getters.getGlobalPolicy().SetSehTracing(*opt.logTraceExceptions);
+				}
 			}
 			if (opt.logDenyList) {
 				pmquell(LineTable::IngestList(*opt.logDenyList, true))
-				pmquell(getters.getLineTable().IngestList_(*opt.logDenyList, true))
+				if (getters) {
+					pmquell(getters.getLineTable().IngestList_(*opt.logDenyList, true))
+				}
 			}
 			else if (opt.logAllowList) {
 				pmquell(LineTable::IngestList(*opt.logAllowList, false))
-				pmquell(getters.getLineTable().IngestList_(*opt.logAllowList, false))
+				if (getters) {
+					pmquell(getters.getLineTable().IngestList_(*opt.logAllowList, false))
+				}
 			}
 		}
 		catch (...) {}
 	}
 	LogChannelManager::LogChannelManager() noexcept
 	{
+		pmon::util::test::MaybeInstallCrtAssertRedirect();
 		InstallSehTranslator();
 		BootDefaultChannelEager();
 	}

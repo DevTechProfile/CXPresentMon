@@ -17,6 +17,8 @@
     <RootNamespace>PresentMonAPI2Tests</RootNamespace>
     <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
     <ProjectSubType>NativeUnitTestProject</ProjectSubType>
+    <RunSettingsFilePath>$(MSBuildProjectDirectory)\..\..\Tests\PresentMonTests.runsettings</RunSettingsFilePath>
+    <RunSettingsFilePath Condition="Exists('$(MSBuildProjectDirectory)\..\..\Tests\PresentMonTests.local.runsettings')">$(MSBuildProjectDirectory)\..\..\Tests\PresentMonTests.local.runsettings</RunSettingsFilePath>
   </PropertyGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'" Label="Configuration">
@@ -110,6 +112,7 @@
     <ClCompile Include="PacedPollingTests.cpp" />
     <ClCompile Include="EtlTests.cpp" />
     <ClCompile Include="Logging.cpp" />
+    <ClCompile Include="MockTelemetryTests.cpp" />
     <ClCompile Include="RealtimeMetricTests.cpp" />
     <ClCompile Include="UiLaunchTests.cpp" />
   </ItemGroup>
@@ -154,6 +157,7 @@
     <ClInclude Include="Logging.h" />
     <ClInclude Include="TestCommands.h" />
     <ClInclude Include="StatusComparison.h" />
+    <ClInclude Include="TestDiagnosticsRedirect.h" />
     <ClInclude Include="TestProcess.h" />
     <ClInclude Include="Utilities.h" />
   </ItemGroup>
@@ -171,5 +175,6 @@
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">
+    <Import Project="..\..\Tests\PresentMonTestData.targets" />
   </ImportGroup>
 </Project>

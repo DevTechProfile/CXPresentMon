@@ -4,8 +4,6 @@
 #include <generated/version.h>
 #include "PresentMonTests.h"
 
-#include <src/gtest-all.cc>
-
 bool EnsureDirectoryCreated(std::wstring path)
 {
     for (auto i = path.find(L'\\');; i = path.find(L'\\', i + 1)) {
@@ -117,15 +115,27 @@ std::wstring diffPath_;
 
 std::string Convert(std::wstring const& src)
 {
-    std::string dst(WideCharToMultiByte(CP_UTF8, 0, src.c_str(), (int) src.size(), nullptr, 0, nullptr, nullptr), 0);
-    WideCharToMultiByte(CP_UTF8, 0, src.c_str(), (int) src.size(), &dst[0], (int) dst.size(), nullptr, nullptr);
+    const int sizeNeeded = WideCharToMultiByte(CP_UTF8, 0, src.c_str(), (int)src.size(), nullptr, 0, nullptr, nullptr);
+    if (sizeNeeded <= 0) {
+        return {};
+    }
+    std::string dst(sizeNeeded, 0);
+    if (WideCharToMultiByte(CP_UTF8, 0, src.c_str(), (int)src.size(), &dst[0], sizeNeeded, nullptr, nullptr) <= 0) {
+        return {};
+    }
     return dst;
 }
 
 std::wstring Convert(std::string const& src)
 {
-    std::wstring dst(MultiByteToWideChar(CP_UTF8, 0, src.c_str(), (int) src.size(), nullptr, 0), 0);
-    MultiByteToWideChar(CP_UTF8, 0, src.c_str(), (int) src.size(), &dst[0], (int) dst.size());
+    const int sizeNeeded = MultiByteToWideChar(CP_UTF8, 0, src.c_str(), (int)src.size(), nullptr, 0);
+    if (sizeNeeded <= 0) {
+        return {};
+    }
+    std::wstring dst(sizeNeeded, 0);
+    if (MultiByteToWideChar(CP_UTF8, 0, src.c_str(), (int)src.size(), &dst[0], sizeNeeded) <= 0) {
+        return {};
+    }
     return dst;
 }
 
@@ -139,7 +149,7 @@ int wmain(
     // Check for additional test directory from environment variable
     // This allows developers to specify their own test directories without
     // modifying the source code. Set PRESENTMON_ADDITIONAL_TEST_DIR environment
-    // variable or use a .runsettings.user file (see template).
+    // variable or use an attached runsettings file (see template).
     std::wstring additionalTestDir;
     wchar_t* envTestDir = nullptr;
     size_t envTestDirLen = 0;
@@ -200,7 +210,12 @@ int wmain(
     // If there is a help argument print help information before GoogleTest
     // does.
     auto help = false;
+    auto listTests = false;
     for (int i = 1; i < argc; ++i) {
+        if (_wcsicmp(argv[i], L"--gtest_list_tests") == 0) {
+            listTests = true;
+        }
+
         if (_wcsicmp(argv[i], L"--help") == 0 ||
             _wcsicmp(argv[i], L"-h") == 0 ||
             _wcsicmp(argv[i], L"-?") == 0 ||
@@ -225,13 +240,12 @@ int wmain(
         }
     }
 
-    // Note: InitGoogleTest() will remove the arguments it recognizes.
+    // Let GoogleTest consume its arguments before validating PresentMonTests-specific options.
     testing::InitGoogleTest(&argc, argv);
     if (help) {
         return 0;
     }
 
-    // Parse remaining command line arguments for custom commands.
     wchar_t* presentMonPathArg = nullptr;
     wchar_t* goldDirArg = nullptr;
     wchar_t* optTestDirArg = nullptr;
@@ -248,7 +262,7 @@ int wmain(
             continue;
         }
 
-        if (_wcsnicmp(argv[i], L"--opttestdir=", 10) == 0) {
+        if (_wcsnicmp(argv[i], L"--opttestdir=", 13) == 0) {
             optTestDirArg = argv[i] + 13;
             continue;
         }
@@ -296,7 +310,7 @@ int wmain(
     
     if (!CheckPath("--presentmon", &PresentMon::exePath_, presentMonPathArg, false, nullptr) ||
         !CheckPath("--golddir", &goldDir, goldDirArg, true, &goldDirExists) ||
-        !CheckPath("--outdir", &outDir_, outDirArg, true, &outDirExists) ||
+        (!listTests && !CheckPath("--outdir", &outDir_, outDirArg, true, &outDirExists)) ||
         (hasOptTestDir && !CheckPath("--opttestdir", &optTestDir, optTestDirArg, true, &optTestDirExists))) {
         return 1;
     }
@@ -311,9 +325,13 @@ int wmain(
 
     // Add tests from optional test directory if specified (command line)
     if (hasOptTestDir) {
-        printf("INFO: Using optional test directory from command line: %ls\n", optTestDir.c_str());
+        if (!listTests) {
+            printf("INFO: Using optional test directory from command line: %ls\n", optTestDir.c_str());
+        }
         if (optTestDirExists) {
-            printf("INFO: Adding tests from test directory: %ls\n", optTestDir.c_str());
+            if (!listTests) {
+                printf("INFO: Adding tests from test directory: %ls\n", optTestDir.c_str());
+            }
             AddGoldEtlCsvTests(optTestDir, optTestDir.size());
         } else {
             fprintf(stderr, "warning: optional test directory does not exist: %ls\n", optTestDir.c_str());
@@ -323,7 +341,9 @@ int wmain(
     
     // Add tests from additional test directory (environment variable)
     if (!additionalTestDir.empty()) {
-        printf("INFO: Using additional test directory from environment: %ls\n", additionalTestDir.c_str());
+        if (!listTests) {
+            printf("INFO: Using additional test directory from environment: %ls\n", additionalTestDir.c_str());
+        }
         // Ensure directory ends with backslash
         if (additionalTestDir.back() != L'\\') {
             additionalTestDir += L'\\';
@@ -331,34 +351,38 @@ int wmain(
         
         auto attr = GetFileAttributes(additionalTestDir.c_str());
         if (attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_DIRECTORY)) {
-            printf("INFO: Adding tests from additional directory: %ls\n", additionalTestDir.c_str());
+            if (!listTests) {
+                printf("INFO: Adding tests from additional directory: %ls\n", additionalTestDir.c_str());
+            }
             AddGoldEtlCsvTests(additionalTestDir, additionalTestDir.size());
         } else {
             fprintf(stderr, "warning: additional test directory does not exist: %ls\n", additionalTestDir.c_str());
         }
     }
     
-    if (!hasOptTestDir && additionalTestDir.empty()) {
+    if (!listTests && !hasOptTestDir && additionalTestDir.empty()) {
         printf("INFO: No optional test directories specified.\n");
     }
 
-    if (outDirExists) {
-        if (deleteOutDir) {
-            fprintf(stderr, "warning: output directory already exists: %ls\n", outDir_.c_str());
-            fprintf(stderr, "         Continuing, but directory won't be deleted afterwards.  Use the\n");
-            fprintf(stderr, "         --nodelete argument, or delete directory before running, to remove this\n");
-            fprintf(stderr, "         warning.\n");
-            deleteOutDir = false;
+    if (!listTests) {
+        if (outDirExists) {
+            if (deleteOutDir) {
+                fprintf(stderr, "warning: output directory already exists: %ls\n", outDir_.c_str());
+                fprintf(stderr, "         Continuing, but directory won't be deleted afterwards.  Use the\n");
+                fprintf(stderr, "         --nodelete argument, or delete directory before running, to remove this\n");
+                fprintf(stderr, "         warning.\n");
+                deleteOutDir = false;
+            }
+        } else {
+            EnsureDirectoryCreated(outDir_);
         }
-    } else {
-        EnsureDirectoryCreated(outDir_);
     }
 
     // Run all the tests
     int result = RUN_ALL_TESTS();
 
     // If there were any failures, disable deleting of the output directory.
-    if (deleteOutDir && ::testing::UnitTest::GetInstance()->failed_test_count() > 0) {
+    if (!listTests && deleteOutDir && ::testing::UnitTest::GetInstance()->failed_test_count() > 0) {
         fprintf(stderr, "warning: not deleting output directory since there were errors\n");
         fprintf(stderr, "         %ls\n", outDir_.c_str());
         deleteOutDir = false;
@@ -366,7 +390,7 @@ int wmain(
 
     // If we created the output directory and the user told us to, delete the
     // output directory.
-    if (deleteOutDir) {
+    if (!listTests && deleteOutDir) {
         DeleteDirectory(outDir_);
     }
 

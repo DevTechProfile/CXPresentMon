@@ -8,6 +8,7 @@
 #include "../CommonUtilities/win/Utilities.h"
 #include "../CommonUtilities/Qpc.h"
 #include "../CommonUtilities/Exception.h"
+#include "../CommonUtilities/log/IdentificationTable.h"
 
 using namespace pmon;
 using namespace std::literals;
@@ -163,6 +164,7 @@ PM_STATUS RealtimePresentMonSession::StartEtwSession() {
     pm_consumer_->mTrackDisplay = true;
     pm_consumer_->mTrackGPU = true;
     pm_consumer_->mTrackGPUVideo = false;
+    pm_consumer_->mTrackD3D12ShaderCompilation = true;
     pm_consumer_->mTrackInput = true;
     pm_consumer_->mTrackFrameType = true;
     pm_consumer_->mTrackAppTiming = true;
@@ -493,6 +495,7 @@ void RealtimePresentMonSession::ProcessEvents(
 }
 
 void RealtimePresentMonSession::Consume(TRACEHANDLE traceHandle) {
+    util::log::IdentificationTable::AddThisThread("etw-consume");
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
 
     // You must call OpenTrace() prior to calling this function
@@ -516,6 +519,7 @@ void RealtimePresentMonSession::Consume(TRACEHANDLE traceHandle) {
 }
 
 void RealtimePresentMonSession::Output() {
+    util::log::IdentificationTable::AddThisThread("frame-out");
     try {
         // Structures to track processes and statistics from recorded events.
         std::vector<ProcessEvent> processEvents;
