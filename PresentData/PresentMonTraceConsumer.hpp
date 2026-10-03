@@ -313,6 +313,7 @@ struct PresentEvent {
 
     PresentEvent();
     PresentEvent(uint32_t fid);
+    ~PresentEvent();
 private:
     PresentEvent(PresentEvent const& copy); // dne
 };
@@ -646,6 +647,9 @@ struct PMTraceConsumer
     void SetAppTimingData(const EVENT_RECORD* pEventRecord);
 
     void SignalEventsReady();
+
+    // Diagnostics: writes the size of every internal tracking structure to the diag log.
+    void WriteDiagnostics();
     
     // -------------------------------------------------------------------------------------------
     // Function for managing app provided events
@@ -654,6 +658,7 @@ struct PMTraceConsumer
         std::function<uint64_t(const AppTimingData&)> timingSelector, bool isPcLatency = true);
     bool IsApplicationPresent(std::shared_ptr<PresentEvent> const& present);
     void SetAppTimingDataAsComplete(uint32_t processId, uint32_t appFrameId);
+    bool IsStaleAppTimingData(AppTimingData const& data, uint64_t now) const;
 
     inline uint32_t GetRingIndex(uint32_t index)
     {

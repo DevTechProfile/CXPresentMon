@@ -252,7 +252,7 @@ bool ParseValue(wchar_t** argv, int argc, int* i, UINT* value)
 // Print command line usage help.
 void PrintUsage()
 {
-    fwprintf(stderr, L"PresentMon %hs\n", PRESENT_MON_VERSION);
+    fwprintf(stderr, L"PresentMon %hs (CapFrameX build cfx.2)\n", PRESENT_MON_VERSION);
 
     // Note: this array is parsed to generate README-ConsoleApplication.md, so do not deviate much
     // from this formatting.  Test any changes by running Tools\generate\readme\generate.cmd

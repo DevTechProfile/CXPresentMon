@@ -31,6 +31,10 @@ namespace pmon::util::metrics
         uint64_t GetLastPresentQpc() const;
         bool IsPrunableBefore(uint64_t minTimestampQpc) const;
 
+        // Diagnostics
+        size_t GetBlockedCount() const { return blocked.size(); }
+        bool HasWaitingDisplayed() const { return waitingDisplayed.has_value(); }
+
         // Frame statistics
         float avgCPUDuration = 0.f;
         float avgGPUDuration = 0.f;

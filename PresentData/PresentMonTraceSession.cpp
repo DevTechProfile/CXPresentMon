@@ -6,6 +6,7 @@
 #include "PresentMonTraceConsumer.hpp"
 #include "PresentMonTraceSession.hpp"
 #include "NvidiaTraceConsumer.hpp"
+#include "Diag.hpp"
 
 #include "ETW/Microsoft_Windows_D3D9.h"
 #include "ETW/Microsoft_Windows_Direct3D12.h"
@@ -76,6 +77,7 @@ template<> void PatchKeyword<Microsoft_Windows_DxgKrnl::Device_Start>           
 template<> void PatchKeyword<Microsoft_Windows_DxgKrnl::Device_Stop>                    (uint64_t* k) { *k &= ~(uint64_t) Microsoft_Windows_DxgKrnl::Keyword::Microsoft_Windows_DxgKrnl_Performance; }
 template<> void PatchKeyword<Microsoft_Windows_DxgKrnl::HwQueue_DCStart>                (uint64_t* k) { *k &= ~(uint64_t) Microsoft_Windows_DxgKrnl::Keyword::Microsoft_Windows_DxgKrnl_Performance; }
 template<> void PatchKeyword<Microsoft_Windows_DxgKrnl::HwQueue_Start>                  (uint64_t* k) { *k &= ~(uint64_t) Microsoft_Windows_DxgKrnl::Keyword::Microsoft_Windows_DxgKrnl_Performance; }
+template<> void PatchKeyword<Microsoft_Windows_DxgKrnl::HwQueue_Stop>                   (uint64_t* k) { *k &= ~(uint64_t) Microsoft_Windows_DxgKrnl::Keyword::Microsoft_Windows_DxgKrnl_Performance; }
 template<> void PatchKeyword<Microsoft_Windows_DxgKrnl::DmaPacket_Info>                 (uint64_t* k) { *k &= ~(uint64_t) Microsoft_Windows_DxgKrnl::Keyword::Microsoft_Windows_DxgKrnl_Performance; }
 template<> void PatchKeyword<Microsoft_Windows_DxgKrnl::DmaPacket_Start>                (uint64_t* k) { *k &= ~(uint64_t) Microsoft_Windows_DxgKrnl::Keyword::Microsoft_Windows_DxgKrnl_Performance; }
 template<> void PatchKeyword<Microsoft_Windows_DxgKrnl::NodeMetadata_Info>              (uint64_t* k) { *k &= ~(uint64_t) Microsoft_Windows_DxgKrnl::Keyword::Microsoft_Windows_DxgKrnl_Performance; }
@@ -289,6 +291,109 @@ void DisableProviders(TRACEHANDLE sessionHandle)
     status = EnableTraceEx2(sessionHandle, &Nvidia_PCL::GUID,                       EVENT_CONTROL_CODE_DISABLE_PROVIDER, 0, 0, 0, 0, nullptr);
 }
 
+// Diagnostics: per-interval consumer statistics, accessed only from the consumer thread.
+struct DiagCallbackState {
+    uint64_t windowStartQpc = 0;
+    uint64_t sessionStartQpc = 0;
+    uint64_t busyQpc = 0;
+    uint64_t eventCount = 0;
+    uint64_t countsByProvider[12] = {};
+    uint64_t maxLagQpc = 0;
+    double sumLagMs = 0.0;
+};
+DiagCallbackState gDiagState;
+
+uint32_t DiagProviderIndex(GUID const& id)
+{
+    if (id == Microsoft_Windows_DxgKrnl::GUID)          return 0;
+    if (id == Microsoft_Windows_DXGI::GUID)             return 1;
+    if (id == Microsoft_Windows_Win32k::GUID)           return 2;
+    if (id == Microsoft_Windows_Dwm_Core::GUID)         return 3;
+    if (id == Microsoft_Windows_D3D9::GUID)             return 4;
+    if (id == Microsoft_Windows_Direct3D12::GUID)       return 5;
+    if (id == Microsoft_Windows_Kernel_Process::GUID ||
+        id == NT_Process::GUID)                         return 6;
+    if (id == Intel_PresentMon::GUID)                   return 7;
+    if (id == NvidiaDisplayDriver_Events::GUID)         return 8;
+    if (id == Nvidia_PCL::GUID)                         return 9;
+    if (id == Microsoft_Windows_EventMetadata::GUID)    return 10;
+    return 11;
+}
+
+struct DiagScope {
+    PMTraceSession* mSession;
+    uint64_t mStartQpc = 0;
+    bool mActive;
+
+    DiagScope(PMTraceSession* session, EVENT_HEADER const& hdr)
+        : mSession(session)
+        , mActive(pmdiag::Enabled())
+    {
+        if (!mActive) {
+            return;
+        }
+
+        mStartQpc = pmdiag::Qpc();
+        auto& s = gDiagState;
+        if (s.windowStartQpc == 0) {
+            s.windowStartQpc = mStartQpc;
+            s.sessionStartQpc = mStartQpc;
+        }
+        s.eventCount += 1;
+        s.countsByProvider[DiagProviderIndex(hdr.ProviderId)] += 1;
+        auto ts = (uint64_t) hdr.TimeStamp.QuadPart;
+        if (session->mIsRealtimeSession && ts != 0 && mStartQpc > ts) {
+            auto lag = mStartQpc - ts;
+            s.maxLagQpc = std::max(s.maxLagQpc, lag);
+            s.sumLagMs += pmdiag::QpcToMs(lag);
+        }
+    }
+
+    ~DiagScope()
+    {
+        if (!mActive) {
+            return;
+        }
+
+        auto& s = gDiagState;
+        auto endQpc = pmdiag::Qpc();
+        s.busyQpc += endQpc - mStartQpc;
+
+        auto windowMs = pmdiag::QpcToMs(endQpc - s.windowStartQpc);
+        if (windowMs < 10000.0) {
+            return;
+        }
+
+        EtwStatus etw = {};
+        bool haveEtw = mSession->QueryEtwStatus(&etw);
+
+        {
+            std::lock_guard<std::mutex> lock(pmdiag::LogMutex());
+            pmdiag::Printf(
+                "[t=%.1fs] CONSUMER events=%llu (%.0f/s) dxgk=%llu dxgi=%llu win32k=%llu dwm=%llu d3d9=%llu d3d12=%llu proc=%llu intelPM=%llu nvdd=%llu pcl=%llu meta=%llu other=%llu\n"
+                "  busy=%.1f%% lag(avg=%.1fms max=%.1fms) privateMB=%.1f etw(ok=%d inUse=%lu total=%lu eventsLost=%lu buffersLost=%lu)\n",
+                pmdiag::QpcToMs(endQpc - s.sessionStartQpc) / 1000.0,
+                (unsigned long long) s.eventCount, s.eventCount * 1000.0 / windowMs,
+                (unsigned long long) s.countsByProvider[0], (unsigned long long) s.countsByProvider[1],
+                (unsigned long long) s.countsByProvider[2], (unsigned long long) s.countsByProvider[3],
+                (unsigned long long) s.countsByProvider[4], (unsigned long long) s.countsByProvider[5],
+                (unsigned long long) s.countsByProvider[6], (unsigned long long) s.countsByProvider[7],
+                (unsigned long long) s.countsByProvider[8], (unsigned long long) s.countsByProvider[9],
+                (unsigned long long) s.countsByProvider[10], (unsigned long long) s.countsByProvider[11],
+                100.0 * pmdiag::QpcToMs(s.busyQpc) / windowMs,
+                s.eventCount ? s.sumLagMs / (double) s.eventCount : 0.0, pmdiag::QpcToMs(s.maxLagQpc),
+                pmdiag::ProcessPrivateBytes() / (1024.0 * 1024.0),
+                (int) haveEtw, etw.mEtwBuffersInUse, etw.mEtwTotalBuffers, etw.mEtwEventsLost, etw.mEtwBuffersLost);
+            mSession->mPMConsumer->WriteDiagnostics();
+            pmdiag::Flush();
+        }
+
+        auto sessionStart = s.sessionStartQpc;
+        s = DiagCallbackState{};
+        s.sessionStartQpc = sessionStart;
+        s.windowStartQpc = pmdiag::Qpc();
+    }
+};
 template<
     bool IS_REALTIME_SESSION,
     bool TRACK_DISPLAY,
@@ -299,6 +404,8 @@ void CALLBACK EventRecordCallback(EVENT_RECORD* pEventRecord)
 {
     auto session = (PMTraceSession*) pEventRecord->UserContext;
     const auto& hdr = pEventRecord->EventHeader;
+
+    DiagScope diagScope(session, hdr);
 
     PMTraceConsumer::EventProcessingScope processingScope(*session->mPMConsumer);
     if (!processingScope) {
@@ -852,6 +959,7 @@ ULONG EnableProvidersListing(
         provider.AddEvent<Microsoft_Windows_DxgKrnl::Device_Stop>();
         provider.AddEvent<Microsoft_Windows_DxgKrnl::HwQueue_DCStart>();
         provider.AddEvent<Microsoft_Windows_DxgKrnl::HwQueue_Start>();
+        provider.AddEvent<Microsoft_Windows_DxgKrnl::HwQueue_Stop>();
         provider.AddEvent<Microsoft_Windows_DxgKrnl::DmaPacket_Info>();
         provider.AddEvent<Microsoft_Windows_DxgKrnl::DmaPacket_Start>();
     }

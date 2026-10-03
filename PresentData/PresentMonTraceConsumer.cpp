@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MIT
 
 #include "PresentMonTraceConsumer.hpp"
+#include "Diag.hpp"
 
 #include "ETW/Intel_PresentMon.h"
 #include "ETW/Microsoft_Windows_D3D9.h"
@@ -211,6 +212,8 @@ PresentEvent::PresentEvent()
     , WaitingForFrameId(false)
     , DisplayedViaFlipFrameType(false)
 {
+    pmdiag::gLivePresentEvents++;
+    pmdiag::gTotalPresentEvents++;
 }
 
 PresentEvent::PresentEvent(uint32_t fid)
@@ -287,6 +290,13 @@ PresentEvent::PresentEvent(uint32_t fid)
     , WaitingForFrameId(false)
     , DisplayedViaFlipFrameType(false)
 {
+    pmdiag::gLivePresentEvents++;
+    pmdiag::gTotalPresentEvents++;
+}
+
+PresentEvent::~PresentEvent()
+{
+    pmdiag::gLivePresentEvents--;
 }
 
 PMTraceConsumer::PMTraceConsumer()
@@ -836,8 +846,10 @@ void PMTraceConsumer::HandleDxgkPresentHistory(
     case PresentMode::Composed_Copy_CPU_GDI:
         if (tokenData == 0) {
             // This is the best we can do, we won't be able to tell how many frames are actually displayed.
-            mPresentsWaitingForDWM.emplace_back(presentEvent);
-            presentEvent->PresentInDwmWaitingStruct = true;
+            if (!presentEvent->PresentInDwmWaitingStruct) {
+                mPresentsWaitingForDWM.emplace_back(presentEvent);
+                presentEvent->PresentInDwmWaitingStruct = true;
+            }
         } else {
             DebugAssert(mPresentByDxgkPresentHistoryTokenData.find(tokenData) == mPresentByDxgkPresentHistoryTokenData.end());
             mPresentByDxgkPresentHistoryTokenData[tokenData] = presentEvent;
@@ -873,8 +885,10 @@ void PMTraceConsumer::HandleDxgkPresentHistoryInfo(EVENT_HEADER const& hdr, uint
     // Composed presents are currently ignored.
     if (//eventIter->second->PresentMode == PresentMode::Composed_Composition_Atlas ||
         (eventIter->second->PresentMode == PresentMode::Composed_Flip && !eventIter->second->SeenWin32KEvents)) {
-        mPresentsWaitingForDWM.emplace_back(eventIter->second);
-        eventIter->second->PresentInDwmWaitingStruct = true;
+        if (!eventIter->second->PresentInDwmWaitingStruct) {
+            mPresentsWaitingForDWM.emplace_back(eventIter->second);
+            eventIter->second->PresentInDwmWaitingStruct = true;
+        }
     }
 
     if (eventIter->second->PresentMode == PresentMode::Composed_Copy_GPU_GDI) {
@@ -1327,11 +1341,11 @@ void PMTraceConsumer::HandleDXGKEvent(EVENT_RECORD* pEventRecord)
                 ? 0
                 : hdr.ProcessId;
 
-            mGpuTrace.RegisterContext(hContext, hDevice, NodeOrdinal, processId);
+            mGpuTrace.RegisterContext(hContext, hDevice, NodeOrdinal, processId, hdr.TimeStamp.QuadPart);
             return;
         }
         case Microsoft_Windows_DxgKrnl::Context_Stop::Id:
-            mGpuTrace.UnregisterContext(mMetadata.GetEventData<uint64_t>(pEventRecord, L"hContext"));
+            mGpuTrace.UnregisterContext(mMetadata.GetEventData<uint64_t>(pEventRecord, L"hContext"), hdr.TimeStamp.QuadPart);
             return;
 
         case Microsoft_Windows_DxgKrnl::HwQueue_DCStart::Id:
@@ -1345,7 +1359,22 @@ void PMTraceConsumer::HandleDXGKEvent(EVENT_RECORD* pEventRecord)
             auto hContext        = desc[0].GetData<uint64_t>();
             auto hHwQueueContext = desc[1].GetData<uint64_t>();
 
-            mGpuTrace.RegisterHwQueueContext(hContext, hHwQueueContext);
+            mGpuTrace.RegisterHwQueueContext(hContext, hHwQueueContext, hdr.TimeStamp.QuadPart);
+            return;
+        }
+
+        // Without HwQueue_Stop the HwQueue contexts would only be released with their parent context,
+        // and packets left on a destroyed HwQueue would stay counted as running.
+        case Microsoft_Windows_DxgKrnl::HwQueue_Stop::Id:
+        {
+            EventDataDesc desc[] = {
+                { L"ParentDxgHwQueue" },
+            };
+            uint32_t descCount = _countof(desc);
+            mMetadata.GetEventData(pEventRecord, desc, &descCount);
+            if (descCount == _countof(desc)) {
+                mGpuTrace.UnregisterHwQueueContext(desc[0].GetData<uint64_t>(), hdr.TimeStamp.QuadPart);
+            }
             return;
         }
 
@@ -1460,7 +1489,7 @@ void PMTraceConsumer::HandleDXGKEvent(EVENT_RECORD* pEventRecord)
                                     for (auto p3 : p2->DependentPresents) {
                                         VerboseTraceBeforeModifyingPresent(p3.get());
                                         p3->WaitingForFlipFrameType = false;
-                                        StopTrackingPresent(p2);
+                                        StopTrackingPresent(p3);
                                     }
 
                                     UpdateReadyCount(true);
@@ -1882,8 +1911,9 @@ void PMTraceConsumer::HandleDWMEvent(EVENT_RECORD* pEventRecord)
         // DependentPresents.
         for (auto& hWndPair : mLastPresentByWindow) {
             auto& present = hWndPair.second;
-            if (present->PresentMode == PresentMode::Composed_Copy_GPU_GDI ||
-                present->PresentMode == PresentMode::Composed_Copy_CPU_GDI) {
+            if ((present->PresentMode == PresentMode::Composed_Copy_GPU_GDI ||
+                 present->PresentMode == PresentMode::Composed_Copy_CPU_GDI) &&
+                !present->PresentInDwmWaitingStruct) {
                 VerboseTraceBeforeModifyingPresent(present.get());
                 mPresentsWaitingForDWM.emplace_back(present);
                 present->PresentInDwmWaitingStruct = true;
@@ -1965,7 +1995,8 @@ void PMTraceConsumer::HandleDWMEvent(EVENT_RECORD* pEventRecord)
 
         Win32KPresentHistoryToken key(luidSurface, PresentCount, bindId);
         auto eventIter = mPresentByWin32KPresentHistoryToken.find(key);
-        if (eventIter != mPresentByWin32KPresentHistoryToken.end() && eventIter->second->SeenInFrameEvent) {
+        if (eventIter != mPresentByWin32KPresentHistoryToken.end() && eventIter->second->SeenInFrameEvent &&
+            !eventIter->second->PresentInDwmWaitingStruct) {
             VerboseTraceBeforeModifyingPresent(eventIter->second.get());
             mPresentsWaitingForDWM.emplace_back(eventIter->second);
             eventIter->second->PresentInDwmWaitingStruct = true;
@@ -2462,6 +2493,11 @@ void PMTraceConsumer::CompletePresent(std::shared_ptr<PresentEvent> const& p)
                 deferredPresent->IsLost = true;
             }
             deferredPresent->WaitingForFlipFrameType = false;
+            // A PresentFrameType present is only released by the next one from its process, so the
+            // last one stays deferred forever once the runtime stops typing frames (e.g., XeSS-FG
+            // switched off or replaced by another frame generation), blocking every process until
+            // the completed ring overflows.
+            deferredPresent->WaitingForFrameId = false;
             StopTrackingPresent(deferredPresent);
             UpdateReadyCount(false);
         }
@@ -2478,6 +2514,12 @@ void PMTraceConsumer::CompletePresent(std::shared_ptr<PresentEvent> const& p)
             presentStartTime >= it->second.AppPresentStartTime &&
             presentStartTime - it->second.AppPresentStartTime >= mDeferralTimeLimit) {
             // Remove app frame data if the app present start time is too old
+            it = mAppTimingDataByAppFrameId.erase(it); // Erase and move to the next element
+        } else if (IsStaleAppTimingData(it->second, presentStartTime)) {
+            // Remove app frame data that can no longer be matched, whichever process it belongs to.
+            // The rules above only consider the completing present's process and need an
+            // AppPresentStart, so data from processes that never present (or never send that
+            // event) would otherwise accumulate, and every present scans this map.
             it = mAppTimingDataByAppFrameId.erase(it); // Erase and move to the next element
         }
         else {
@@ -2526,11 +2568,46 @@ void PMTraceConsumer::CompletePresent(std::shared_ptr<PresentEvent> const& p)
                 } else {
                     ++it;
                 }
+            } else if (IsStaleAppTimingData(it->second, presentStartTime)) {
+                // Stale data of another process, e.g., one that stopped presenting.
+                it = mPclTimingDataByPclFrameId.erase(it);
             } else {
                 ++it;
             }
         }
     }
+}
+
+bool PMTraceConsumer::IsStaleAppTimingData(AppTimingData const& data, uint64_t now) const
+{
+    // App timing data is matched to a present within a few frames.  Anything that has not seen an
+    // update for several deferral periods cannot be matched any more.
+    if (mDeferralTimeLimit == 0) {
+        return false;
+    }
+
+    uint64_t latest = std::max({
+        data.AppSleepStartTime,
+        data.AppSleepEndTime,
+        data.AppSimStartTime,
+        data.AppSimEndTime,
+        data.AppRenderSubmitStartTime,
+        data.AppRenderSubmitEndTime,
+        data.AppPresentStartTime,
+        data.AppPresentEndTime,
+        data.AppInputSample.first,
+        data.PclSimStartTime,
+        data.PclSimEndTime,
+        data.PclRenderSubmitStartTime,
+        data.PclRenderSubmitEndTime,
+        data.PclPresentStartTime,
+        data.PclPresentEndTime,
+        data.PclInputPingTime,
+        data.PclInputReceivedTime,
+        data.PclOutOfBandPresentStartTime,
+    });
+
+    return latest != 0 && now > latest && now - latest > 4 * mDeferralTimeLimit;
 }
 
 void PMTraceConsumer::UpdateReadyCount(bool useLock)
@@ -3910,4 +3987,115 @@ void PMTraceConsumer::SetAppTimingDataAsComplete(uint32_t processId, uint32_t ap
         DebugAssert(ii->second.ProcessId == processId);
         ii->second.PresentCompleted = true;
     }
+}
+
+void PMTraceConsumer::WriteDiagnostics()
+{
+    size_t trackedNonNull = 0;
+    for (auto const& p : mTrackedPresents) {
+        if (p != nullptr) {
+            trackedNonNull += 1;
+        }
+    }
+
+    size_t orderedTotal = 0;
+    size_t orderedMax = 0;
+    uint32_t orderedMaxPid = 0;
+    for (auto const& pr : mOrderedPresentsByProcessId) {
+        orderedTotal += pr.second.size();
+        if (pr.second.size() > orderedMax) {
+            orderedMax = pr.second.size();
+            orderedMaxPid = pr.first;
+        }
+    }
+
+    size_t submitTotal = 0;
+    for (auto const& pr : mPresentBySubmitSequence) {
+        submitTotal += pr.second.size();
+    }
+
+    size_t appTimingNoPresentStart = 0;
+    size_t appTimingAssigned = 0;
+    std::unordered_map<uint32_t, size_t> appTimingByPid;
+    for (auto const& pr : mAppTimingDataByAppFrameId) {
+        if (pr.second.AppPresentStartTime == 0) {
+            appTimingNoPresentStart += 1;
+        }
+        if (pr.second.AssignedToPresent) {
+            appTimingAssigned += 1;
+        }
+        appTimingByPid[pr.second.ProcessId] += 1;
+    }
+    uint32_t appTimingMaxPid = 0;
+    size_t appTimingMax = 0;
+    for (auto const& pr : appTimingByPid) {
+        if (pr.second > appTimingMax) {
+            appTimingMax = pr.second;
+            appTimingMaxPid = pr.first;
+        }
+    }
+
+    size_t dwmWaitingCompleted = 0;
+    std::unordered_set<PresentEvent const*> dwmWaitingDistinct;
+    for (auto const& p : mPresentsWaitingForDWM) {
+        dwmWaitingDistinct.insert(p.get());
+        if (p->IsCompleted) {
+            dwmWaitingCompleted += 1;
+        }
+    }
+
+    uint32_t completedCount = 0;
+    uint32_t readyCount = 0;
+    size_t completedWaitingFlip = 0;
+    size_t completedWaitingStop = 0;
+    size_t completedWaitingFrameId = 0;
+    size_t completedDependents = 0;
+    {
+        std::lock_guard<std::mutex> lock(mPresentEventMutex);
+        completedCount = mCompletedCount;
+        readyCount = mReadyCount;
+        for (uint32_t i = 0; i < mCompletedCount; ++i) {
+            auto const& p = mCompletedPresents[GetRingIndex(mCompletedIndex + i)];
+            if (p == nullptr) {
+                continue;
+            }
+            if (p->WaitingForFlipFrameType) completedWaitingFlip += 1;
+            if (p->WaitingForPresentStop) completedWaitingStop += 1;
+            if (p->WaitingForFrameId) completedWaitingFrameId += 1;
+            completedDependents += p->DependentPresents.size();
+        }
+    }
+
+    size_t processEventCount = 0;
+    {
+        std::lock_guard<std::mutex> lock(mProcessEventMutex);
+        processEventCount = mProcessEvents.size();
+    }
+
+    pmdiag::Printf(
+        "  consumer: livePresentEvents=%lld totalPresentEvents=%lld tracked=%zu completed=%u ready=%u overflowed=%u\n"
+        "            completedWaitingFlipFrameType=%zu completedWaitingPresentStop=%zu completedWaitingFrameId=%zu completedDependents=%zu\n"
+        "            presentByThreadId=%zu orderedPresents(procs=%zu total=%zu max=%zu pid=%u) presentBySubmitSequence=%zu/%zu\n"
+        "            win32kToken=%zu dxgkToken=%zu dxgkTokenData=%zu dxgkContext=%zu vidPnLayer=%zu lastPresentByWindow=%zu\n"
+        "            presentsWaitingForDWM=%zu (distinct=%zu completed=%zu) dwmPid=%u dwmThread=%u\n"
+        "            appTimingData=%zu (noPresentStart=%zu assigned=%zu pids=%zu maxPid=%u max=%zu) presentByAppFrameId=%zu\n"
+        "            pclTimingData=%zu latestPing=%zu hybridMode=%zu pendingPresentFrameType=%zu pendingFlipFrameType=%zu enableFlipFrameType=%d\n"
+        "            mouseClickByHwnd=%zu retrievedInput=%zu processEvents=%zu metadata=%zu nvFlipReq=%zu nvLastFlip=%zu\n",
+        (long long) pmdiag::gLivePresentEvents.load(), (long long) pmdiag::gTotalPresentEvents.load(),
+        trackedNonNull, completedCount, readyCount, GetNumOverflowedPresents(),
+        completedWaitingFlip, completedWaitingStop, completedWaitingFrameId, completedDependents,
+        mPresentByThreadId.size(), mOrderedPresentsByProcessId.size(), orderedTotal, orderedMax, orderedMaxPid,
+        mPresentBySubmitSequence.size(), submitTotal,
+        mPresentByWin32KPresentHistoryToken.size(), mPresentByDxgkPresentHistoryToken.size(),
+        mPresentByDxgkPresentHistoryTokenData.size(), mPresentByDxgkContext.size(), mPresentByVidPnLayerId.size(),
+        mLastPresentByWindow.size(),
+        mPresentsWaitingForDWM.size(), dwmWaitingDistinct.size(), dwmWaitingCompleted, DwmProcessId, DwmPresentThreadId,
+        mAppTimingDataByAppFrameId.size(), appTimingNoPresentStart, appTimingAssigned, appTimingByPid.size(),
+        appTimingMaxPid, appTimingMax, mPresentByAppFrameId.size(),
+        mPclTimingDataByPclFrameId.size(), mLatestPingTimestampByProcessId.size(), mHybridPresentModeBySwapChainPid.size(),
+        mPendingPresentFrameTypeEvents.size(), mPendingFlipFrameTypeEvents.size(), (int) mEnableFlipFrameTypeEvents,
+        mReceivedMouseClickByHwnd.size(), mRetrievedInput.size(), processEventCount, mMetadata.metadata_.size(),
+        mNvTraceConsumer.mNvFlipRequestByThreadId.size(), mNvTraceConsumer.mLastFlipTimeByHead.size());
+
+    mGpuTrace.WriteDiagnostics();
 }
