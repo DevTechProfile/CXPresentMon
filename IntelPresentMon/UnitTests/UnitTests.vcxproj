@@ -109,6 +109,7 @@
     <ClCompile Include="MetricCapabilitiesTests.cpp" />
     <ClCompile Include="MetricsCore.cpp" />
     <ClCompile Include="IgclControlLibCompatibilityTests.cpp" />
+    <ClCompile Include="PcLatencyFrameGenerationTests.cpp" />
     <ClCompile Include="PresentFrameTypeDeferralTests.cpp" />
     <ClCompile Include="TelemetryAvailabilityMergeTests.cpp" />
     <ClCompile Include="SwapChainTests.cpp" />
