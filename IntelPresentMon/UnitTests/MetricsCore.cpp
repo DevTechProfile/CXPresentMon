@@ -1509,6 +1509,47 @@ TEST_CLASS(ComputeMetricsForPresentTests)
             Assert::AreEqual(uint64_t(999), chain.lastDisplayedFlipDelay);
         }
 
+        TEST_METHOD(ComputeMetricsForPresent_AmdFsrFg_GeneratedRowsFirst_AppRowOnNext)
+        {
+            QpcConverter qpc(10'000'000, 0);
+            SwapChainCoreState chain{};
+
+            // 3x AMD_FSR_FG then 1 Application
+            FrameData present = MakeFrame(
+                PresentResult::Presented,
+                20'000, 600, 30'000,
+                {
+                    { FrameType::AMD_FSR_FG, 21'000 },
+                    { FrameType::AMD_FSR_FG, 21'500 },
+                    { FrameType::AMD_FSR_FG, 22'000 },
+                    { FrameType::Application, 22'500 },
+                });
+
+            // Without nextDisplayed the generated rows are released, the Application row is postponed
+            auto metrics = ComputeMetricsForPresent(qpc, present, nullptr, chain);
+            Assert::AreEqual(size_t(3), metrics.size());
+            for (auto const& m : metrics) {
+                Assert::IsTrue(FrameType::AMD_FSR_FG == m.metrics.frameType, L"FrameType should be AMD_FSR_FG");
+            }
+            Assert::AreEqual(uint64_t(21'000), metrics[0].metrics.screenTimeQpc);
+            Assert::AreEqual(uint64_t(21'500), metrics[1].metrics.screenTimeQpc);
+            Assert::AreEqual(uint64_t(22'000), metrics[2].metrics.screenTimeQpc);
+            Assert::IsFalse(chain.lastAppPresent.has_value());
+
+            FrameData nextDisplayed = MakeFrame(
+                PresentResult::Presented,
+                23'000, 400, 30'500,
+                { { FrameType::Application, 24'000 } });
+
+            // With nextDisplayed only the postponed Application row is released and the chain is updated
+            metrics = ComputeMetricsForPresent(qpc, present, &nextDisplayed, chain);
+            Assert::AreEqual(size_t(1), metrics.size());
+            Assert::IsTrue(FrameType::Application == metrics[0].metrics.frameType, L"FrameType should be Application");
+            Assert::AreEqual(uint64_t(22'500), metrics[0].metrics.screenTimeQpc);
+            Assert::IsTrue(chain.lastAppPresent.has_value());
+            Assert::AreEqual(uint64_t(22'500), chain.lastDisplayedScreenTime);
+        }
+
         TEST_METHOD(ComputeMetricsForPresent_IntelXefg_MultiPresentSequence_VaryingDisplayedVectorSizes)
         {
             QpcConverter qpc(10'000'000, 0);
